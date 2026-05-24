@@ -1218,7 +1218,15 @@ async function startPipeline(){
     }
     wrap.appendChild(barWrap);wrap.appendChild(labWrap);
     const sum=document.createElement('div');sum.className='tl-summary';
-    sum.innerHTML=`<span>${d.timeline.length}</span> certificates · peak month <span>${d.peak_month}</span> (<span>${d.peak_count}</span> certs)`;
+    // Build with text nodes — peak_month comes from cert data (external)
+    const t1=document.createTextNode('');
+    const s1=document.createElement('span');s1.textContent=String(d.timeline.length);
+    const t2=document.createTextNode(' certificates · peak month ');
+    const s2=document.createElement('span');s2.textContent=String(d.peak_month||'?');
+    const t3=document.createTextNode(' (');
+    const s3=document.createElement('span');s3.textContent=String(d.peak_count||0);
+    const t4=document.createTextNode(' certs)');
+    [s1,t2,s2,t3,s3,t4].forEach(n=>sum.appendChild(n));
     wrap.appendChild(sum);
     body.appendChild(wrap);
   });
