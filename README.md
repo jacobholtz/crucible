@@ -15,7 +15,7 @@
 
 **The foundational analytical approach in CRUCIBLE is directly inspired by the work of Ryan McDonald** (Principal Security Engineer | USMC 0341).
 
-Ryan published ["Fingerprinting Malicious Infrastructure Using Free Resources"](https://www.linkedin.com/in/ryan-mcdonald/) (LinkedIn, May 2026), documenting his passive pivot of the **DSJ Exchange / BG Wealth Sharing LTD** pig-butchering operation — a $150M cryptocurrency fraud that victimized thousands of people, ultimately traced by FBI Operation Level Up with $41M in stolen funds frozen.
+Ryan published ["Fingerprinting Malicious Infrastructure Using Free Resources"] (LinkedIn, May 2026), documenting his passive pivot of the **DSJ Exchange / BG Wealth Sharing LTD** pig-butchering operation — a $150M cryptocurrency fraud that victimized thousands of people, ultimately traced by FBI Operation Level Up with $41M in stolen funds frozen.
 
 Ryan demonstrated — using only free passive sources (crt.sh, urlscan.io, DNS, WHOIS, manual JS inspection) — how a single confirmed-bad domain maps an entire 47-domain criminal infrastructure cluster, identifies on-chain wallet drain mechanisms, and reveals the two-layer brand structure of a large-scale scam operation.
 
