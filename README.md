@@ -187,10 +187,10 @@ PRs welcome. The most valuable additions would be:
 
 ## Author
 
-**Randy Bator** | Security 360, LLC DBA NEATLABS™  
+**Randy B** | Security 360, LLC DBA NEATLABS™  
 28+ years cybersecurity · USAF Veteran · IRS/DoD practitioner  
-[rbator@neatlabs.ai](mailto:rbator@neatlabs.ai) · [neatlabs.ai](https://neatlabs.ai)  
-[LinkedIn](https://linkedin.com/in/randy-b-84aa6731)
+[neatlabs.ai](https://neatlabs.ai)  
+
 
 ---
 
