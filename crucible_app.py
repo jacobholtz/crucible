@@ -301,7 +301,9 @@ async def fetch_cert_timeline(domain: str, certs: list[dict]) -> list[dict]:
 
 def extract_domains_from_certs(certs: list[dict], seed: str) -> list[dict]:
     seen = {seed}
-    domains = [{"name": seed, "source": "seed", "flag": None}]
+    seed_label = seed.rsplit(".", 1)[0] if "." in seed else seed
+    domains = [{"name": seed, "source": "seed", "flag": None,
+                "entropy": round(shannon_entropy(seed_label), 2)}]
     for c in certs:
         for name in (c.get("name_value") or "").split("\n"):
             n = name.strip().lower().lstrip("*.")
@@ -309,12 +311,55 @@ def extract_domains_from_certs(certs: list[dict], seed: str) -> list[dict]:
                 seen.add(n)
                 flag = "NEIBU" if n.startswith("neibu") else None
                 src = "certspotter" if c.get("_source") == "certspotter" else "cert"
-                domains.append({"name": n, "source": src, "flag": flag})
+                label = n.rsplit(".", 1)[0] if "." in n else n
+                domains.append({"name": n, "source": src, "flag": flag,
+                                 "entropy": round(shannon_entropy(label), 2)})
     return domains
 
 # ════════════════════════════════════════════════════════════
 # THREAT SCORING — 12 signals, weighted additive model
 # ════════════════════════════════════════════════════════════
+
+def shannon_entropy(s: str) -> float:
+    """
+    Compute Shannon entropy of a string in bits.
+    High entropy (>3.5) = likely machine-generated / DGA domain.
+    Low entropy (<2.5)  = human-readable / brand name.
+
+    Signal suggested by Ryan McDonald as a valuable weight for surfacing
+    dynamically-generated domain infrastructure within a CT cluster.
+    Reference: Dark Reading tutorials on DGA entropy analysis.
+    """
+    import math
+    if not s:
+        return 0.0
+    freq = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    n = len(s)
+    return -sum((count / n) * math.log2(count / n) for count in freq.values())
+
+
+def domain_entropy_score(domains: list[dict]) -> tuple[float, float, int]:
+    """
+    Returns (mean_entropy, max_entropy, high_entropy_count) for the domain cluster.
+    Strips TLD before computing — we care about the label entropy, not .com vs .cc.
+    """
+    entropies = []
+    for d in domains:
+        name = d["name"]
+        label = name.rsplit(".", 1)[0] if "." in name else name
+        # Strip common known-good prefixes that would dilute entropy
+        label = label.lstrip("www.").lstrip("api.").lstrip("mail.")
+        if len(label) >= 4:
+            entropies.append(shannon_entropy(label))
+    if not entropies:
+        return 0.0, 0.0, 0
+    mean_e = sum(entropies) / len(entropies)
+    max_e  = max(entropies)
+    high_count = sum(1 for e in entropies if e >= 3.5)
+    return round(mean_e, 2), round(max_e, 2), high_count
+
 
 def compute_threat_score(data: dict) -> dict:
     domains    = data.get("domains", [])
@@ -409,6 +454,26 @@ def compute_threat_score(data: dict) -> dict:
                  "exofdsj","neibu168","neibud123","ddjea","ddjeb","dsjhout","bgwealthalert")
     signals["known_operation_match"] = (100 if any(kw in all_names for kw in known_kws) else 0, 3.0)
 
+    # S13 — Shannon entropy (suggested by Ryan McDonald)
+    # High mean entropy across the cluster = machine-generated / DGA domains.
+    # Scam-kit operations generate domain names algorithmically — entropy surfaces this.
+    # The cluster average is more diagnostic than any single domain's entropy.
+    # Weight: 2.0 — strong signal when cluster is large, weaker with few domains.
+    mean_e, max_e, high_e_count = domain_entropy_score(domains)
+    if len(domains) >= 3:
+        # Mean entropy ≥ 3.5 across cluster = highly likely DGA/auto-generated
+        # Mean entropy 3.0–3.5 = suspicious
+        # Mean entropy < 3.0 = human-readable (normal brand domains)
+        entropy_score = (90 if mean_e >= 3.5
+                         else 65 if mean_e >= 3.2
+                         else 35 if mean_e >= 3.0
+                         else 0)
+    else:
+        # Single domain: score on the seed's own entropy, lower weight
+        seed_entropy = shannon_entropy(domains[0]["name"].rsplit(".",1)[0]) if domains else 0
+        entropy_score = (70 if seed_entropy >= 3.5 else 40 if seed_entropy >= 3.2 else 0)
+    signals["shannon_entropy"] = (entropy_score, 2.0)
+
     # Determine which signals have backing data — skip those we couldn't evaluate
     has_ct   = len(domains) > 1           # CT returned more than just the seed
     has_rdap = bool(rdap)                 # RDAP query succeeded
@@ -453,6 +518,7 @@ def compute_threat_score(data: dict) -> dict:
         "confidence": confidence, "sources_available": sources_available,
         "signals_fired": [n for n,(s,_) in signals.items() if s>0],
         "js_scan": js_scan, "urlscan_hits": us_total,
+        "entropy": {"mean": mean_e, "max": max_e, "high_count": high_e_count},
     }
 
 def parse_rdap_summary(rdap: dict) -> dict:
@@ -612,9 +678,25 @@ async def run_standard_pipeline(seed: str):
 
     # ── S7: Threat Score ──
     yield sse("stage",{"n":7,"state":"active"})
-    yield sse("log",{"msg":"S7: Computing composite threat score — 12 weighted signals","type":"info","stage":"S7"})
+    yield sse("log",{"msg":"S7: Computing composite threat score — 13 weighted signals","type":"info","stage":"S7"})
+
+    # Sort domain cluster by entropy descending before scoring.
+    # Per Ryan McDonald's suggestion: high-entropy domains are DGA/auto-generated
+    # backend infrastructure and should surface to the top of the cluster view.
+    result["domains"] = sorted(result["domains"], key=lambda d: d.get("entropy", 0), reverse=True)
+    yield sse("domains",{"domains":result["domains"],"source":"sorted_by_entropy"})
+
     score_data = compute_threat_score(result)
     result["score"] = score_data
+
+    # Log entropy analysis
+    ent = score_data.get("entropy", {})
+    if ent.get("mean", 0) > 0:
+        yield sse("log",{
+            "msg": f"S7: Shannon entropy — cluster mean:{ent['mean']} max:{ent['max']} high-entropy count:{ent['high_count']} — {'DGA/machine-generated' if ent['mean']>=3.5 else 'suspicious' if ent['mean']>=3.0 else 'human-readable'}",
+            "type": "err" if ent["mean"] >= 3.5 else "warn" if ent["mean"] >= 3.0 else "ok",
+            "stage": "S7"
+        })
     for sig in score_data.get("signals_fired",[]):
         v = score_data["factors"].get(sig,0)
         yield sse("log",{"msg":f"S7: ↑ {sig.replace('_',' ').upper()} [{v}/100]",
