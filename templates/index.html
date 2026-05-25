@@ -574,7 +574,7 @@ input.seed:focus,textarea.seed:focus{border-color:var(--cyan);box-shadow:inset 0
         <li><strong>KNOWN OPERATION MATCH [weight 3.0]:</strong> Domain matches documented DSJ/BG Wealth Sharing infrastructure fingerprint.</li>
         <li><strong>SCAM NAMING PATTERN [weight 2.5]:</strong> Short random prefixes (dsj*, ffs*, ge7*), suspicious TLDs (.cc, .top), or known scam keywords.</li>
         <li><strong>DOMAIN VOLUME [weight 2.0]:</strong> 10+ domains from CT = scam-kit-as-a-service. Single operators running 47+ frontends with admin-panel-managed rotation.</li>
-        <li><strong>SHANNON ENTROPY [weight 2.0]:</strong> Suggested by Ryan McDonald. High mean entropy across the cluster (≥3.5 bits) indicates machine-generated / DGA domain names — the scam-kit backend infrastructure. Domains are sorted by entropy so the operational layer surfaces first. Human-chosen brand names score low; auto-generated backend names score high.</li>
+        <li><strong>SHANNON ENTROPY [weight 2.0]:</strong> High mean entropy across the cluster (≥3.5 bits) indicates machine-generated / DGA domain names — the scam-kit backend infrastructure. Domains are sorted by entropy so the operational layer surfaces first. Human-chosen brand names score low; auto-generated backend names score high.</li>
       </ul>
       <h4>What Registrars Mean</h4>
       <ul>
@@ -1187,7 +1187,7 @@ async function startPipeline(){
       const item=document.createElement('div');item.className='di';
       item.style.animationDelay=`${Math.min(domainCount,20)*0.03}s`;
       item.appendChild(safeText('span','dn',dom.name));
-      // Entropy badge — Ryan McDonald signal
+      // Entropy badge — DGA/machine-generated domain signal
       if(dom.entropy!=null){
         const ebadge=document.createElement('span');
         ebadge.className='badge';
@@ -1377,7 +1377,7 @@ async function startPipeline(){
     const sigs=[
       {label:'DOMAIN VOLUME',   value:String(domainCount),sub:'MAPPED',           cls:domainCount>10?'shi':domainCount>3?'smed':'slo'},
       {label:'NEIBU SIGNAL',    value:(sc.neibu_admin_portal||0)>0?'YES':'NO',    sub:'ADMIN PORTALS',cls:(sc.neibu_admin_portal||0)>0?'shi':'slo'},
-      {label:'ENTROPY (MEAN)',  value:d.entropy?.mean!=null?String(d.entropy.mean):'?',sub:'DGA SIGNAL · Ryan McDonald',cls:(d.entropy?.mean||0)>=3.5?'shi':(d.entropy?.mean||0)>=3.2?'smed':'slo'},
+      {label:'ENTROPY (MEAN)',  value:d.entropy?.mean!=null?String(d.entropy.mean):'?',sub:'DGA SIGNAL',cls:(d.entropy?.mean||0)>=3.5?'shi':(d.entropy?.mean||0)>=3.2?'smed':'slo'},
       {label:'JS DRAIN',        value:sc.js_wallet_drain===100?'DETECTED':sc.js_wallet_drain>0?'PARTIAL':'CLEAR',sub:'WALLET SCAN',cls:sc.js_wallet_drain>=100?'shi':sc.js_wallet_drain>0?'smed':'slo'},
     ];
     for(const s of sigs){
