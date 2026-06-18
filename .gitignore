@@ -58,3 +58,4 @@ $RECYCLE.BIN/
 # Local dev overrides
 local_settings.py
 instance/
+.claude/

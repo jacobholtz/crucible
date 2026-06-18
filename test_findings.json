@@ -1,0 +1,21 @@
+{
+  "example.com": {
+    "last_status": {
+      "domain": "example.com",
+      "timestamp": "2026-06-01T20:44:23.576318",
+      "online": true,
+      "ip_address": "104.20.23.154",
+      "hosting_provider": "CLOUDFLARENET",
+      "ssl_info": {
+        "valid": true,
+        "issuer": null,
+        "expiration": null
+      },
+      "changes_detected": [],
+      "errors": []
+    },
+    "last_checked": "2026-06-01T20:44:23.952925",
+    "decay_score": 0.0,
+    "changes": []
+  }
+}
