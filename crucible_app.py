@@ -425,6 +425,50 @@ async def fetch_crtsh(domain: str, sources: set[str] | None = None) -> list[dict
         return results
     raise RuntimeError("No certificate transparency sources available")
 
+async def _ct_summary_for_domain(domain: str) -> dict | None:
+    """Look up CT certs for a single domain via certspotter (fast, reliable) and
+    return a compact summary. Returns None on failure / empty so the caller can
+    drop unknown domains cleanly. crt.sh is intentionally not used here — for an
+    N-domain enrichment loop, a single crt.sh outage shouldn't slow the lot."""
+    try:
+        got, rows = await _ct_certspotter(domain)
+    except Exception:
+        return None
+    if not got or not rows:
+        return None
+    dates = [r.get("not_before","") for r in rows if r.get("not_before")]
+    dates.sort()
+    return {
+        "domain": domain,
+        "cert_count": len(rows),
+        "first_seen": dates[0][:10] if dates else "",
+        "last_seen":  dates[-1][:10] if dates else "",
+        "source": "certspotter",
+    }
+
+async def enrich_neighbors_with_ct(domains: list[str], limit: int = 25,
+                                   concurrency: int = 5) -> list[dict]:
+    """Run CT lookups on a deduped, capped set of neighbor / IP-hosted domains.
+    Used after reverse-IP and reverse-NS settle so the analyst can see, per
+    neighbor, when the domain first showed up in CT logs (issuance bursts are a
+    campaign signal, even when the neighbor itself looks unrelated)."""
+    seen, ordered = set(), []
+    for d in domains:
+        if not d: continue
+        key = d.lower().strip(".")
+        if key in seen: continue
+        seen.add(key)
+        ordered.append(key)
+        if len(ordered) >= limit: break
+    if not ordered:
+        return []
+    sem = asyncio.Semaphore(concurrency)
+    async def _bounded(d):
+        async with sem:
+            return await _ct_summary_for_domain(d)
+    results = await asyncio.gather(*[_bounded(d) for d in ordered], return_exceptions=True)
+    return [r for r in results if isinstance(r, dict)]
+
 async def fetch_dns(name: str, rtype: str = "A") -> dict:
     r = await client.get(f"https://dns.google/resolve?name={name}&type={rtype}",
                          headers={"Accept":"application/dns-json"}, timeout=8.0)
@@ -553,11 +597,16 @@ async def fetch_domain_registration(domain: str) -> dict:
         return whois
     raise RuntimeError(f"No registration data (RDAP or WHOIS) for {domain}")
 
-async def fetch_urlscan(domain: str) -> dict:
-    """urlscan.io — free, no auth needed for search, ~1000 req/day unauthenticated."""
+async def fetch_urlscan(seed: str) -> dict:
+    """urlscan.io — free, no auth needed for search, ~1000 req/day unauthenticated.
+
+    Routes by seed kind: IP seeds use `page.ip:`, domain seeds use `domain:`. A
+    `domain:` query against an IP returns nothing, so always classify first."""
+    is_ip = validate_ip(seed) is not None
+    query = f"page.ip:%22{seed}%22" if is_ip else f"domain:{seed}"
     try:
         r = await client.get(
-            f"https://urlscan.io/api/v1/search/?q=domain:{domain}&size=20",
+            f"https://urlscan.io/api/v1/search/?q={query}&size=20",
             headers={"Accept": "application/json"}, timeout=15.0)
         if r.status_code == 200:
             data = r.json()
@@ -593,53 +642,6 @@ async def fetch_domains_on_ip(ip: str) -> list[str]:
     except Exception:
         pass
     return sorted(domains)
-
-async def scan_js_for_wallet_drain(domain: str) -> dict:
-    """Fetch the domain's HTML then any linked JS bundles, scan for wallet drain patterns."""
-    findings = {"max_uint": False, "erc20": False, "trc20": False,
-                "approve_calls": [], "suspicious_patterns": [], "bundles_checked": 0}
-    try:
-        r = await client.get(f"https://{domain}", timeout=10.0,
-                             headers={"User-Agent":"Mozilla/5.0 (compatible; CRUCIBLE-SIGINT/5.0)"})
-        if r.status_code not in (200, 206): return findings
-        html = r.text[:100000]
-
-        # Find JS bundle URLs
-        js_urls = re.findall(r'src=["\']([^"\']*\.js[^"\']*)["\']', html)
-        chunk_urls = [u for u in js_urls if any(kw in u.lower() for kw in ("chunk","bundle","app","main"))]
-
-        # Also check inline script
-        inline = " ".join(re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL))
-        all_js = inline
-
-        for js_url in chunk_urls[:5]:
-            try:
-                if not js_url.startswith("http"):
-                    js_url = f"https://{domain}/{js_url.lstrip('/')}"
-                jr = await client.get(js_url, timeout=10.0)
-                if jr.status_code == 200:
-                    all_js += jr.text
-                    findings["bundles_checked"] += 1
-            except Exception:
-                pass
-
-        # Ryan's key pattern: MAX_UINT approve()
-        if re.search(r'0xf{60,}', all_js, re.IGNORECASE):
-            findings["max_uint"] = True
-            findings["approve_calls"].append("MAX_UINT (0xfff...fff) detected in approve() call")
-        if re.search(r'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', all_js, re.IGNORECASE):
-            findings["max_uint"] = True
-            findings["approve_calls"].append("MAX_UINT hex string detected")
-        if "window.ethereum" in all_js: findings["erc20"] = True
-        if "window.tronWeb" in all_js:  findings["trc20"] = True
-        if re.search(r'approve\s*\(', all_js): findings["suspicious_patterns"].append("approve() call found")
-        if re.search(r'transferFrom\s*\(', all_js): findings["suspicious_patterns"].append("transferFrom() call found")
-        if re.search(r'\.mobileconfig', html): findings["suspicious_patterns"].append(".mobileconfig Web Clip detected (App Store bypass)")
-        if re.search(r'CN=Android Debug', all_js): findings["suspicious_patterns"].append("Android debug cert signature detected (sideload-only APK)")
-
-    except Exception:
-        pass
-    return findings
 
 async def fetch_cert_timeline(domain: str, certs: list[dict]) -> list[dict]:
     """Build cert issuance timeline from crt.sh results."""
@@ -1356,7 +1358,7 @@ class _StageDisabled(Exception):
 
 async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, features: set[str] | None = None):
     result = {"seed":seed,"domains":[],"dns":{},"ip_results":[],"rdap":None,
-              "urlscan":{},"js_scan":{},"cert_timeline":[],"infrastructure_timeline":[]}
+              "urlscan":{},"cert_timeline":[],"infrastructure_timeline":[]}
 
     # Settings from the Settings tab. Default to everything enabled when not supplied.
     if ct_sources is None:
@@ -1387,8 +1389,8 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                           "type": "warn", "stage": "INIT"})
 
     # Emit the canonical registrable (eTLD+1) up front so the client can fold
-    # later same-base subdomains (from S16/S18/S19) into the DOMAIN FAMILY panel
-    # without re-implementing the public suffix list in JS.
+    # later same-base subdomains into the DOMAIN FAMILY panel without
+    # re-implementing the public suffix list in JS.
     seed_reg = registrable_domain(seed) if not is_ip else None
     yield sse("seedMeta", {"seed": seed, "registrable": seed_reg, "is_ip": is_ip})
 
@@ -1705,34 +1707,15 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         yield sse("chip",{"id":"urlscan","state":"pend"})
     yield sse("stage",{"n":6,"state":"done"})
 
-    # ── S7: JS Wallet Drain Scan ──
-    yield sse("stage",{"n":7,"state":"active"})
-    yield sse("log",{"msg":f"S7: JS bundle scan for wallet drain patterns (Ryan McDonald methodology)","type":"live","stage":"S7"})
-    result["js_scan"] = await scan_js_for_wallet_drain(seed)
-    js = result["js_scan"]
-    yield sse("jsScan",{"data":js})
-    if js.get("max_uint"):
-        yield sse("log",{"msg":"S7: !! MAX_UINT APPROVE DETECTED — approve(0xffff...ffff) in deposit flow","type":"err","stage":"S7"})
-        yield sse("log",{"msg":"S7: Persistent wallet drain — operator can drain all USDT at any time","type":"err","stage":"S7"})
-    elif js.get("erc20") or js.get("trc20"):
-        yield sse("log",{"msg":"S7: Crypto wallet interfaces detected (window.ethereum / window.tronWeb)","type":"warn","stage":"S7"})
-    elif js.get("bundles_checked",0)>0:
-        yield sse("log",{"msg":f"S7: {js['bundles_checked']} bundles scanned — no MAX_UINT pattern found","type":"ok","stage":"S7"})
-    else:
-        yield sse("log",{"msg":"S7: JS scan inconclusive — domain may use Cloudflare bot protection or be offline","type":"info","stage":"S7"})
-    for pat in js.get("suspicious_patterns",[]):
-        yield sse("log",{"msg":f"S7: Pattern → {pat}","type":"warn","stage":"S7"})
-    yield sse("stage",{"n":7,"state":"done"})
-
     # Sort the cluster by label entropy so machine-generated names surface to
     # the top of the DOMAIN FAMILY panel — purely a display ordering, not a
     # threat verdict.
     result["domains"] = sorted(result["domains"], key=lambda d: d.get("entropy", 0), reverse=True)
     yield sse("domains",{"domains":result["domains"],"source":"sorted_by_entropy"})
 
-    # ── S9: Shodan Intelligence ──
-    yield sse("stage",{"n":8,"state":"active"})
-    yield sse("log",{"msg":"S8: Gathering Shodan intelligence for resolved IPs","type":"live","stage":"S8"})
+    # ── S7: Shodan Intelligence ──
+    yield sse("stage",{"n":7,"state":"active"})
+    yield sse("log",{"msg":"S7: Gathering Shodan intelligence for resolved IPs","type":"live","stage":"S7"})
     
     # Get Shodan data for the first IP we found
     shodan_results = []
@@ -1746,21 +1729,21 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 if not shodan_data.get("error"):
                     open_ports = shodan_data.get("open_ports", [])
                     if open_ports:
-                        yield sse("log",{"msg":f"S8: Shodan found {len(open_ports)} open ports on {ip}: {open_ports}","type":"ok","stage":"S8"})
+                        yield sse("log",{"msg":f"S7: Shodan found {len(open_ports)} open ports on {ip}: {open_ports}","type":"ok","stage":"S7"})
                         # Check for risky ports
                         risky_ports = [21, 22, 23, 25, 53, 110, 143, 445, 1433, 3306, 3389, 5432, 6379, 27017]
                         found_risky = [port for port in open_ports if port in risky_ports]
                         if found_risky:
-                            yield sse("log",{"msg":f"S8: !! RISKY PORTS DETECTED: {found_risky}","type":"err","stage":"S8"})
+                            yield sse("log",{"msg":f"S7: !! RISKY PORTS DETECTED: {found_risky}","type":"err","stage":"S7"})
                     else:
-                        yield sse("log",{"msg":f"S8: Shodan check complete for {ip} - no open ports found","type":"ok","stage":"S8"})
+                        yield sse("log",{"msg":f"S7: Shodan check complete for {ip} - no open ports found","type":"ok","stage":"S7"})
                 else:
-                    yield sse("log",{"msg":f"S8: Shodan error for {ip}: {shodan_data.get('error')}","type":"warn","stage":"S8"})
+                    yield sse("log",{"msg":f"S7: Shodan error for {ip}: {shodan_data.get('error')}","type":"warn","stage":"S7"})
             else:
-                yield sse("log",{"msg":"S8: Shodan API key not configured - skipping","type":"info","stage":"S8"})
+                yield sse("log",{"msg":"S7: Shodan API key not configured - skipping","type":"info","stage":"S7"})
                 break
         except Exception as e:
-            yield sse("log",{"msg":f"S8: Shodan check failed for {ip}: {str(e)}","type":"warn","stage":"S8"})
+            yield sse("log",{"msg":f"S7: Shodan check failed for {ip}: {str(e)}","type":"warn","stage":"S7"})
 
     if shodan_results:
         yield sse("chip",{"id":"shodan","state":"live"})
@@ -1768,11 +1751,11 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         yield sse("chip",{"id":"shodan","state":"fail"})
     # Keep the per-IP list around — S19 (pivot stage) extracts JARMs from it.
     result["shodan_per_ip"] = shodan_results
-    yield sse("stage",{"n":8,"state":"done"})
+    yield sse("stage",{"n":7,"state":"done"})
 
-    # ── S10: VirusTotal Passive DNS ──
-    yield sse("stage",{"n":9,"state":"active"})
-    yield sse("log",{"msg":"S9: Checking VirusTotal passive DNS history","type":"live","stage":"S9"})
+    # ── S8: VirusTotal Passive DNS ──
+    yield sse("stage",{"n":8,"state":"active"})
+    yield sse("log",{"msg":"S8: Checking VirusTotal passive DNS history","type":"live","stage":"S8"})
     
     try:
         if VIRUSTOTAL_API_KEY:
@@ -1784,29 +1767,29 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                     # IP seed → VT returns historical domains that resolved to this IP.
                     domain_history = vt_data.get("domain_history", [])
                     if domain_history:
-                        yield sse("log",{"msg":f"S9: VirusTotal found {len(domain_history)} historical domains for {seed}","type":"ok","stage":"S9"})
+                        yield sse("log",{"msg":f"S8: VirusTotal found {len(domain_history)} historical domains for {seed}","type":"ok","stage":"S8"})
                         for entry in domain_history:
-                            yield sse("log",{"msg":f"S9: Historical domain: {entry['domain']} (last resolved: {entry['last_resolved']})","type":"ok","stage":"S9"})
+                            yield sse("log",{"msg":f"S8: Historical domain: {entry['domain']} (last resolved: {entry['last_resolved']})","type":"ok","stage":"S8"})
                     else:
-                        yield sse("log",{"msg":"S9: VirusTotal found no historical domains","type":"info","stage":"S9"})
+                        yield sse("log",{"msg":"S8: VirusTotal found no historical domains","type":"info","stage":"S8"})
                 else:
                     ip_history = vt_data.get("ip_history", [])
                     if ip_history:
-                        yield sse("log",{"msg":f"S9: VirusTotal found {len(ip_history)} historical IP addresses","type":"ok","stage":"S9"})
+                        yield sse("log",{"msg":f"S8: VirusTotal found {len(ip_history)} historical IP addresses","type":"ok","stage":"S8"})
                         # Stream every historical IP so the analyst sees the full pivot
                         # surface in the log, not just the most recent few.
                         for ip_entry in ip_history:
-                            yield sse("log",{"msg":f"S9: Historical IP: {ip_entry['ip']} (last resolved: {ip_entry['last_resolved']})","type":"ok","stage":"S9"})
+                            yield sse("log",{"msg":f"S8: Historical IP: {ip_entry['ip']} (last resolved: {ip_entry['last_resolved']})","type":"ok","stage":"S8"})
                     else:
-                        yield sse("log",{"msg":"S9: VirusTotal found no historical IP addresses","type":"info","stage":"S9"})
+                        yield sse("log",{"msg":"S8: VirusTotal found no historical IP addresses","type":"info","stage":"S8"})
             else:
-                yield sse("log",{"msg":f"S9: VirusTotal error: {vt_data.get('error')}","type":"warn","stage":"S9"})
+                yield sse("log",{"msg":f"S8: VirusTotal error: {vt_data.get('error')}","type":"warn","stage":"S8"})
         else:
-            yield sse("log",{"msg":"S9: VirusTotal API key not configured - skipping","type":"info","stage":"S9"})
+            yield sse("log",{"msg":"S8: VirusTotal API key not configured - skipping","type":"info","stage":"S8"})
     except Exception as e:
-        yield sse("log",{"msg":f"S9: VirusTotal check failed: {str(e)}","type":"warn","stage":"S9"})
+        yield sse("log",{"msg":f"S8: VirusTotal check failed: {str(e)}","type":"warn","stage":"S8"})
 
-    # S10 continued: VT reputation — vendor verdict counts + reputation score.
+    # S8 continued: VT reputation — vendor verdict counts + reputation score.
     # Surfaces critical findings (5+ malicious verdicts or reputation <= -50)
     # so they bubble into the findings panel rather than only the raw event.
     if VIRUSTOTAL_API_KEY:
@@ -1814,24 +1797,24 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             vt_rep = await fetch_virustotal_reputation(seed, VIRUSTOTAL_API_KEY)
             result["virustotal_reputation"] = vt_rep
             if vt_rep.get("error"):
-                yield sse("log",{"msg":f"S9: VT reputation: {vt_rep['error']}","type":"warn","stage":"S9"})
+                yield sse("log",{"msg":f"S8: VT reputation: {vt_rep['error']}","type":"warn","stage":"S8"})
             elif vt_rep.get("not_found"):
-                yield sse("log",{"msg":f"S9: VT reputation: {seed} not present in VT corpus","type":"info","stage":"S9"})
+                yield sse("log",{"msg":f"S8: VT reputation: {seed} not present in VT corpus","type":"info","stage":"S8"})
             else:
-                yield sse("log",{"msg":f"S9: VT reputation: verdict={vt_rep.get('verdict')} malicious={vt_rep.get('malicious')}/{vt_rep.get('total')} reputation={vt_rep.get('reputation')}","type":"info","stage":"S9"})
+                yield sse("log",{"msg":f"S8: VT reputation: verdict={vt_rep.get('verdict')} malicious={vt_rep.get('malicious')}/{vt_rep.get('total')} reputation={vt_rep.get('reputation')}","type":"info","stage":"S8"})
                 for f in _findings_from_vt(vt_rep, context_seed=seed):
                     yield sse("finding", f)
             yield sse("vtReputation", vt_rep)
         except Exception as e:
-            yield sse("log",{"msg":f"S9: VT reputation failed: {str(e)}","type":"warn","stage":"S9"})
+            yield sse("log",{"msg":f"S8: VT reputation failed: {str(e)}","type":"warn","stage":"S8"})
 
     yield sse("chip",{"id":"virustotal","state":"live" if VIRUSTOTAL_API_KEY and not result.get('virustotal', {}).get('error') else "fail"})
-    yield sse("stage",{"n":9,"state":"done"})
+    yield sse("stage",{"n":8,"state":"done"})
 
     # Merge historical IPs from VT passive DNS + URLScan + current DNS A records
     # into a single event so the frontend can show the full IP history of the
     # domain — the core of the infrastructure-pivot workflow.
-    hist_list = []  # initialized empty so the S10 stage below can read it unconditionally
+    hist_list = []  # initialized empty so the S9 stage below can read it unconditionally
     if not is_ip:
       hist_ips = {}  # ip -> {sources, first_seen, last_seen}
       def _add_hist(ip, source, seen_ts=""):
@@ -1868,13 +1851,13 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
           otx_pdns = await fetch_otx_domain_passive_dns(seed, ALIENVAULT_API_KEY)
           result["otx_domain_pdns"] = otx_pdns
           if otx_pdns.get("error"):
-            yield sse("log", {"msg": f"S10: OTX domain pDNS: {otx_pdns['error']}", "type": "warn", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: OTX domain pDNS: {otx_pdns['error']}", "type": "warn", "stage": "S9"})
           else:
             for rec in otx_pdns.get("records", []):
               _add_hist(rec["ip"], "otx_pdns", rec.get("last") or rec.get("first") or "")
-            yield sse("log", {"msg": f"S10: OTX domain pDNS → {otx_pdns.get('count', 0)} historical observation(s) with timestamps", "type": "info", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: OTX domain pDNS → {otx_pdns.get('count', 0)} historical observation(s) with timestamps", "type": "info", "stage": "S9"})
         except Exception as e:
-          yield sse("log", {"msg": f"S10: OTX domain pDNS failed: {e}", "type": "warn", "stage": "S10"})
+          yield sse("log", {"msg": f"S9: OTX domain pDNS failed: {e}", "type": "warn", "stage": "S9"})
       # Source 5: CIRCL.lu passive DNS — EU sensor coverage, historical A/AAAA
       # with timestamps. Skipped silently if no credentials are configured.
       if CIRCL_PDNS_USERNAME and CIRCL_PDNS_PASSWORD:
@@ -1882,28 +1865,28 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
           circl = await fetch_circl_pdns(seed, CIRCL_PDNS_USERNAME, CIRCL_PDNS_PASSWORD)
           result["circl_pdns"] = circl
           if circl.get("error"):
-            yield sse("log", {"msg": f"S10: CIRCL PDNS: {circl['error']}", "type": "warn", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: CIRCL PDNS: {circl['error']}", "type": "warn", "stage": "S9"})
           else:
             for rec in circl.get("records", []):
               _add_hist(rec["ip"], "circl_pdns", rec.get("last") or rec.get("first") or "")
-            yield sse("log", {"msg": f"S10: CIRCL PDNS → {circl.get('count', 0)} historical observation(s)",
-                              "type": "info", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: CIRCL PDNS → {circl.get('count', 0)} historical observation(s)",
+                              "type": "info", "stage": "S9"})
         except Exception as e:
-          yield sse("log", {"msg": f"S10: CIRCL PDNS failed: {e}", "type": "warn", "stage": "S10"})
+          yield sse("log", {"msg": f"S9: CIRCL PDNS failed: {e}", "type": "warn", "stage": "S9"})
       # Source 6: Mnemonic Argus passive DNS — Nordic/EU visibility.
       if MNEMONIC_API_KEY:
         try:
           mnem = await fetch_mnemonic_pdns(seed, MNEMONIC_API_KEY)
           result["mnemonic_pdns"] = mnem
           if mnem.get("error"):
-            yield sse("log", {"msg": f"S10: Mnemonic PDNS: {mnem['error']}", "type": "warn", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: Mnemonic PDNS: {mnem['error']}", "type": "warn", "stage": "S9"})
           else:
             for rec in mnem.get("records", []):
               _add_hist(rec["ip"], "mnemonic_pdns", rec.get("last") or rec.get("first") or "")
-            yield sse("log", {"msg": f"S10: Mnemonic PDNS → {mnem.get('count', 0)} historical observation(s)",
-                              "type": "info", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: Mnemonic PDNS → {mnem.get('count', 0)} historical observation(s)",
+                              "type": "info", "stage": "S9"})
         except Exception as e:
-          yield sse("log", {"msg": f"S10: Mnemonic PDNS failed: {e}", "type": "warn", "stage": "S10"})
+          yield sse("log", {"msg": f"S9: Mnemonic PDNS failed: {e}", "type": "warn", "stage": "S9"})
       # Source 7: SELF-TRACKING — our own SQLite store of past observations.
       # Surfaces "we ourselves saw this IP on date X" alongside external sources,
       # filling gaps when external feeds drop a domain or never carried it.
@@ -1912,10 +1895,10 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         for rec in own:
           _add_hist(rec["ip"], "self_tracking", rec.get("last_observed") or rec.get("first_observed") or "")
         if own:
-          yield sse("log", {"msg": f"S10: Self-tracking PDNS → {len(own)} IP(s) from prior scans of this seed",
-                            "type": "info", "stage": "S10"})
+          yield sse("log", {"msg": f"S9: Self-tracking PDNS → {len(own)} IP(s) from prior scans of this seed",
+                            "type": "info", "stage": "S9"})
       except Exception as e:
-        yield sse("log", {"msg": f"S10: Self-tracking PDNS read failed: {e}", "type": "warn", "stage": "S10"})
+        yield sse("log", {"msg": f"S9: Self-tracking PDNS read failed: {e}", "type": "warn", "stage": "S9"})
 
       # Persist every (ip, source, observed_at) tuple from this run into the
       # self-tracking store. Idempotent on the UNIQUE constraint, so re-running
@@ -1933,10 +1916,10 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
               })
           inserted = pdns_store.record_observations(scan_id, seed, obs_rows)
           if inserted:
-            yield sse("log", {"msg": f"S10: Self-tracking PDNS recorded {inserted} new observation(s)",
-                              "type": "ok", "stage": "S10"})
+            yield sse("log", {"msg": f"S9: Self-tracking PDNS recorded {inserted} new observation(s)",
+                              "type": "ok", "stage": "S9"})
         except Exception as e:
-          yield sse("log", {"msg": f"S10: Self-tracking PDNS write failed: {e}", "type": "warn", "stage": "S10"})
+          yield sse("log", {"msg": f"S9: Self-tracking PDNS write failed: {e}", "type": "warn", "stage": "S9"})
 
       if hist_ips:
         # Convert sets to lists for JSON serialization
@@ -1946,16 +1929,16 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         for h in hist_list:
           h["current"] = h["ip"] in current
         yield sse("historicalIps", {"ips": hist_list, "total": len(hist_list), "current_count": len(ips)})
-        yield sse("log", {"msg": f"S10: {len(hist_list)} historical IPs across {len(set(s for h in hist_list for s in h['sources']))} sources — {len(ips)} currently active", "type": "ok", "stage": "S10"})
+        yield sse("log", {"msg": f"S9: {len(hist_list)} historical IPs across {len(set(s for h in hist_list for s in h['sources']))} sources — {len(ips)} currently active", "type": "ok", "stage": "S9"})
 
-    # ── S18: abuse.ch ThreatFox + OTX passive-DNS cross-reference ──
-    # The existing S14 IOC correlation only does exact-match lookups on the seed,
+    # ── S9: abuse.ch ThreatFox + OTX passive-DNS cross-reference ──
+    # The existing S13 IOC correlation only does exact-match lookups on the seed,
     # which misses sister IOCs (e.g. *.bet30bet.com listings co-hosted on the same
     # IPs). ThreatFox's search_ioc does substring matching on the value field, so
     # we query the seed AND each resolved IP. OTX's IP passive_dns rounds out the
     # picture with historical sister domains seen by the OTX community.
-    yield sse("stage", {"n":10, "state": "active"})
-    yield sse("log", {"msg": "S10: Cross-referencing abuse.ch ThreatFox + AlienVault OTX for sister IOCs", "type": "live", "stage":"S10"})
+    yield sse("stage", {"n":9, "state": "active"})
+    yield sse("log", {"msg": "S9: Cross-referencing abuse.ch ThreatFox + AlienVault OTX for sister IOCs", "type": "live", "stage":"S9"})
     # Build the IP set to query — current resolved IPs plus any historical IPs
     # we just merged. Dedupe and cap so a long history doesn't burn the budget.
     if not is_ip:
@@ -1977,30 +1960,30 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
 
     # 1. ThreatFox — best-effort even without a key (some queries still work)
     if not is_ip and len(threatfox_seed_terms) > 1:
-        yield sse("log", {"msg": f"S10: ThreatFox seed-side terms: exact={threatfox_seed_terms[0]} + brand={threatfox_seed_terms[1]} (substring-match for sister subdomains)", "type": "info", "stage":"S10"})
+        yield sse("log", {"msg": f"S9: ThreatFox seed-side terms: exact={threatfox_seed_terms[0]} + brand={threatfox_seed_terms[1]} (substring-match for sister subdomains)", "type": "info", "stage":"S9"})
     try:
         tf_data = await fetch_threatfox(threatfox_seed_terms, ip_pool, ABUSECH_API_KEY)
         result["threatfox"] = tf_data
         if tf_data.get("error") and not tf_data.get("matches"):
-            yield sse("log", {"msg": f"S10: ThreatFox: {tf_data['error']}", "type": "warn", "stage":"S10"})
+            yield sse("log", {"msg": f"S9: ThreatFox: {tf_data['error']}", "type": "warn", "stage":"S9"})
         else:
             n = len(tf_data.get("matches") or [])
             sh, ih = tf_data.get("seed_hits", 0), tf_data.get("ip_hits", 0)
             if n:
-                yield sse("log", {"msg": f"S10: ThreatFox matched {n} IOC{'s' if n!=1 else ''} ({sh} via seed, {ih} via IPs)", "type": "warn", "stage":"S10"})
+                yield sse("log", {"msg": f"S9: ThreatFox matched {n} IOC{'s' if n!=1 else ''} ({sh} via seed, {ih} via IPs)", "type": "warn", "stage":"S9"})
                 # Log the top few so they show in the live stream
                 for row in (tf_data["matches"] or [])[:8]:
                     fam = row.get("malware") or row.get("threat_type") or "?"
-                    yield sse("log", {"msg": f"S10: ThreatFox: {row.get('ioc')}  [{row.get('ioc_type','?')}]  {fam}  last={row.get('last_seen') or '?'}", "type": "warn", "stage":"S10"})
+                    yield sse("log", {"msg": f"S9: ThreatFox: {row.get('ioc')}  [{row.get('ioc_type','?')}]  {fam}  last={row.get('last_seen') or '?'}", "type": "warn", "stage":"S9"})
                 # Elevate named-family / threat-type matches as structured findings
                 # so they render prominently above the log instead of scrolling past.
                 for f in _findings_from_threatfox(tf_data, context_seed=seed):
                     yield sse("finding", f)
             else:
-                yield sse("log", {"msg": "S10: ThreatFox returned no matches for seed or resolved IPs", "type": "info", "stage":"S10"})
+                yield sse("log", {"msg": "S9: ThreatFox returned no matches for seed or resolved IPs", "type": "info", "stage":"S9"})
             yield sse("threatfox", tf_data)
     except Exception as e:
-        yield sse("log", {"msg": f"S10: ThreatFox query failed: {e}", "type": "warn", "stage":"S10"})
+        yield sse("log", {"msg": f"S9: ThreatFox query failed: {e}", "type": "warn", "stage":"S9"})
 
     # 2. OTX IP passive-DNS — surfaces sister domains observed on each IP
     if not is_ip and ALIENVAULT_API_KEY:
@@ -2008,7 +1991,7 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             otx_sister = await fetch_otx_ip_passive_dns(ip_pool, ALIENVAULT_API_KEY)
             result["otx_sister"] = otx_sister
             if otx_sister.get("error") and not otx_sister.get("flat"):
-                yield sse("log", {"msg": f"S10: OTX passive-DNS: {otx_sister['error']}", "type": "warn", "stage":"S10"})
+                yield sse("log", {"msg": f"S9: OTX passive-DNS: {otx_sister['error']}", "type": "warn", "stage":"S9"})
             else:
                 flat = otx_sister.get("flat") or []
                 seed_norm = (seed or "").lower().strip(".")
@@ -2016,18 +1999,18 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 flat = [r for r in flat if r["hostname"] != seed_norm]
                 otx_sister["flat"] = flat
                 if flat:
-                    yield sse("log", {"msg": f"S10: OTX passive-DNS surfaced {len(flat)} sister domain{'s' if len(flat)!=1 else ''} across {len(ip_pool)} IP{'s' if len(ip_pool)!=1 else ''}", "type": "warn", "stage":"S10"})
+                    yield sse("log", {"msg": f"S9: OTX passive-DNS surfaced {len(flat)} sister domain{'s' if len(flat)!=1 else ''} across {len(ip_pool)} IP{'s' if len(ip_pool)!=1 else ''}", "type": "warn", "stage":"S9"})
                     for row in flat[:6]:
-                        yield sse("log", {"msg": f"S10: OTX sister: {row['hostname']}  on {','.join(row['ips'])}  last={row.get('last') or '?'}", "type": "warn", "stage":"S10"})
+                        yield sse("log", {"msg": f"S9: OTX sister: {row['hostname']}  on {','.join(row['ips'])}  last={row.get('last') or '?'}", "type": "warn", "stage":"S9"})
                 else:
-                    yield sse("log", {"msg": "S10: OTX passive-DNS returned no additional sister domains", "type": "info", "stage":"S10"})
+                    yield sse("log", {"msg": "S9: OTX passive-DNS returned no additional sister domains", "type": "info", "stage":"S9"})
                 yield sse("otxSister", otx_sister)
         except Exception as e:
-            yield sse("log", {"msg": f"S10: OTX passive-DNS failed: {e}", "type": "warn", "stage":"S10"})
+            yield sse("log", {"msg": f"S9: OTX passive-DNS failed: {e}", "type": "warn", "stage":"S9"})
     elif not ALIENVAULT_API_KEY:
-        yield sse("log", {"msg": "S10: OTX passive-DNS skipped — AlienVault OTX API key not configured", "type": "info", "stage":"S10"})
+        yield sse("log", {"msg": "S9: OTX passive-DNS skipped — AlienVault OTX API key not configured", "type": "info", "stage":"S9"})
 
-    # S18 continued: OTX pulse memberships — surfaces named malware families
+    # S9 continued: OTX pulse memberships — surfaces named malware families
     # and attacker-tooling tags (RAT/ransomware/loader/...) that the passive-DNS
     # call doesn't carry. Queries seed + up to 8 IPs in parallel.
     if ALIENVAULT_API_KEY:
@@ -2036,28 +2019,28 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             otx_general = await fetch_otx_general(otx_seeds, ALIENVAULT_API_KEY)
             result["otx_general"] = otx_general
             if otx_general.get("error") and not otx_general.get("per_seed"):
-                yield sse("log", {"msg": f"S10: OTX pulses: {otx_general['error']}", "type": "warn", "stage":"S10"})
+                yield sse("log", {"msg": f"S9: OTX pulses: {otx_general['error']}", "type": "warn", "stage":"S9"})
             else:
                 total_pulses = sum(len(e.get("pulses") or []) for e in (otx_general.get("per_seed") or []))
                 if total_pulses:
-                    yield sse("log", {"msg": f"S10: OTX surfaced {total_pulses} pulse membership(s) across seed+IPs", "type": "info", "stage":"S10"})
+                    yield sse("log", {"msg": f"S9: OTX surfaced {total_pulses} pulse membership(s) across seed+IPs", "type": "info", "stage":"S9"})
                 else:
-                    yield sse("log", {"msg": "S10: OTX returned no pulse memberships for seed or IPs", "type": "info", "stage":"S10"})
+                    yield sse("log", {"msg": "S9: OTX returned no pulse memberships for seed or IPs", "type": "info", "stage":"S9"})
                 for f in _findings_from_otx_pulses(otx_general, context_seed=seed):
                     yield sse("finding", f)
             yield sse("otxGeneral", otx_general)
         except Exception as e:
-            yield sse("log", {"msg": f"S10: OTX pulse lookup failed: {e}", "type": "warn", "stage":"S10"})
+            yield sse("log", {"msg": f"S9: OTX pulse lookup failed: {e}", "type": "warn", "stage":"S9"})
 
-    yield sse("stage", {"n":10, "state": "done"})
+    yield sse("stage", {"n":9, "state": "done"})
 
-    # ── S19: Platform pivots — favicon mmh3, body hash, tracker IDs, JARM, reverse-NS ──
+    # ── S10: Platform pivots — favicon mmh3, body hash, tracker IDs, JARM, reverse-NS ──
     # The major pivoting platforms (Validin / Silent Push / Censys / Shodan /
     # DT Iris / Maltego) all key on the same handful of fingerprints. This
     # stage computes them seed-side and runs the corresponding reverse-pivots
     # against Shodan + Censys + HackerTarget.
-    yield sse("stage", {"n":11, "state": "active"})
-    yield sse("log", {"msg": "S11: Computing pivot fingerprints (favicon mmh3, body SHA-256, tracking IDs, JARM) in parallel", "type": "live", "stage":"S11"})
+    yield sse("stage", {"n":10, "state": "active"})
+    yield sse("log", {"msg": "S10: Computing pivot fingerprints (favicon mmh3, body SHA-256, tracking IDs, JARM) in parallel", "type": "live", "stage":"S10"})
 
     # Build the nameserver list once so both the rev-NS call and any later
     # consumer see the same view.
@@ -2090,24 +2073,24 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             results_p1 = await asyncio.gather(*tasks, return_exceptions=True)
             fp_or_err = results_p1[0]
             if isinstance(fp_or_err, Exception):
-                yield sse("log", {"msg": f"S11: Seed fingerprint failed: {fp_or_err}", "type": "warn", "stage":"S11"})
+                yield sse("log", {"msg": f"S10: Seed fingerprint failed: {fp_or_err}", "type": "warn", "stage":"S10"})
             else:
                 fp = fp_or_err
                 result["pivot_fingerprint"] = fp
                 if fp.get("favicon_hash") is not None:
-                    yield sse("log", {"msg": f"S11: Favicon mmh3 = {fp['favicon_hash']}  (md5={fp.get('favicon_md5','?')[:12]}…, {fp.get('favicon_bytes',0)}B from {fp.get('favicon_url','?')})", "type": "ok", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Favicon mmh3 = {fp['favicon_hash']}  (md5={fp.get('favicon_md5','?')[:12]}…, {fp.get('favicon_bytes',0)}B from {fp.get('favicon_url','?')})", "type": "ok", "stage":"S10"})
                 else:
-                    yield sse("log", {"msg": "S11: Favicon not retrievable — skipping Shodan/Censys favicon pivot", "type": "info", "stage":"S11"})
+                    yield sse("log", {"msg": "S10: Favicon not retrievable — skipping Shodan/Censys favicon pivot", "type": "info", "stage":"S10"})
                 if fp.get("body_sha256"):
-                    yield sse("log", {"msg": f"S11: Body SHA-256 = {fp['body_sha256'][:16]}…  normalized={fp.get('body_sha256_norm','')[:16]}…", "type": "ok", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Body SHA-256 = {fp['body_sha256'][:16]}…  normalized={fp.get('body_sha256_norm','')[:16]}…", "type": "ok", "stage":"S10"})
                 if fp.get("tracking_ids"):
                     ids_summary = ", ".join(f"{t['label']}={t['value']}" for t in fp["tracking_ids"][:6])
-                    yield sse("log", {"msg": f"S11: Tracking IDs ({len(fp['tracking_ids'])}): {ids_summary}", "type": "warn", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Tracking IDs ({len(fp['tracking_ids'])}): {ids_summary}", "type": "warn", "stage":"S10"})
                 yield sse("contentFingerprint", fp)
             if ns_list:
                 ns_or_err = results_p1[1]
                 if isinstance(ns_or_err, Exception):
-                    yield sse("log", {"msg": f"S11: Reverse-NS failed: {ns_or_err}", "type": "warn", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Reverse-NS failed: {ns_or_err}", "type": "warn", "stage":"S10"})
                     yield sse("reverseNs", {"per_ns": [], "flat": [], "error": f"failed: {ns_or_err}"})
                 else:
                     ns_data = ns_or_err
@@ -2116,16 +2099,16 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                     flat = [r for r in flat if r["hostname"] != seed_norm]
                     ns_data["flat"] = flat
                     result["reverse_ns"] = ns_data
-                    yield sse("log", {"msg": f"S11: Reverse-NS — {len(flat)} sister domain{'s' if len(flat)!=1 else ''} across {len(ns_list)} nameserver{'s' if len(ns_list)!=1 else ''}", "type": "warn" if flat else "info", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Reverse-NS — {len(flat)} sister domain{'s' if len(flat)!=1 else ''} across {len(ns_list)} nameserver{'s' if len(ns_list)!=1 else ''}", "type": "warn" if flat else "info", "stage":"S10"})
                     for row in flat[:6]:
-                        yield sse("log", {"msg": f"S11: Reverse-NS: {row['hostname']}  via {','.join(row['nameservers'])}", "type": "warn", "stage":"S11"})
+                        yield sse("log", {"msg": f"S10: Reverse-NS: {row['hostname']}  via {','.join(row['nameservers'])}", "type": "warn", "stage":"S10"})
                     yield sse("reverseNs", ns_data)
             else:
-                yield sse("log", {"msg": "S11: Reverse-NS skipped — no nameservers identified for seed", "type": "info", "stage":"S11"})
+                yield sse("log", {"msg": "S10: Reverse-NS skipped — no nameservers identified for seed", "type": "info", "stage":"S10"})
         except Exception as e:
-            yield sse("log", {"msg": f"S11: Phase-1 fan-out failed: {e}", "type": "warn", "stage":"S11"})
+            yield sse("log", {"msg": f"S10: Phase-1 fan-out failed: {e}", "type": "warn", "stage":"S10"})
 
-    # JARM extraction from Shodan data already fetched in S9 — CPU-only.
+    # JARM extraction from Shodan data already fetched in S7 — CPU-only.
     # extract_jarms_from_shodan_results filters out the 62-char all-zero
     # sentinel Shodan stores when a probe got no usable TLS Server Hello,
     # so an empty result here means "no real fingerprint available".
@@ -2140,18 +2123,18 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         if jarms:
             result["jarms"] = jarms
             total_eps = sum(j.get("endpoint_count", 0) for j in jarms)
-            yield sse("log", {"msg": f"S11: JARM fingerprints — {len(jarms)} distinct across {total_eps} endpoint(s)", "type": "warn", "stage":"S11"})
+            yield sse("log", {"msg": f"S10: JARM fingerprints — {len(jarms)} distinct across {total_eps} endpoint(s)", "type": "warn", "stage":"S10"})
             for j in jarms[:6]:
                 eps = j.get("endpoint_count", 0)
                 ips = j.get("distinct_ips", 0)
                 ep0 = (j.get("endpoints") or [{}])[0]
-                yield sse("log", {"msg": f"S11: JARM {j['jarm']} — {eps} endpoint(s) across {ips} IP(s) (e.g. {ep0.get('ip','?')}:{ep0.get('port','?')})", "type": "ok", "stage":"S11"})
+                yield sse("log", {"msg": f"S10: JARM {j['jarm']} — {eps} endpoint(s) across {ips} IP(s) (e.g. {ep0.get('ip','?')}:{ep0.get('port','?')})", "type": "ok", "stage":"S10"})
             yield sse("jarmPivot", {"jarms": jarms})
         elif raw_jarm_count:
-            yield sse("log", {"msg": f"S11: Shodan returned {raw_jarm_count} JARM record(s) but all were the all-zero null sentinel — no usable fingerprint (host likely behind CDN / refused TLS probe)", "type": "info", "stage":"S11"})
+            yield sse("log", {"msg": f"S10: Shodan returned {raw_jarm_count} JARM record(s) but all were the all-zero null sentinel — no usable fingerprint (host likely behind CDN / refused TLS probe)", "type": "info", "stage":"S10"})
             yield sse("jarmPivot", {"jarms": []})
     except Exception as e:
-        yield sse("log", {"msg": f"S11: JARM extraction failed: {e}", "type": "warn", "stage":"S11"})
+        yield sse("log", {"msg": f"S10: JARM extraction failed: {e}", "type": "warn", "stage":"S10"})
 
     # Phase 2: favicon-hash-dependent pivots — Shodan + Censys run in parallel
     # once we have the hash from phase 1.
@@ -2167,26 +2150,26 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             result["favicon_pivot_censys"] = cs_piv
             # Shodan
             if sh_piv.get("error"):
-                yield sse("log", {"msg": f"S11: Shodan favicon pivot: {sh_piv['error']}", "type": "info", "stage":"S11"})
+                yield sse("log", {"msg": f"S10: Shodan favicon pivot: {sh_piv['error']}", "type": "info", "stage":"S10"})
             else:
                 n = len(sh_piv.get("matches") or [])
-                yield sse("log", {"msg": f"S11: Shodan favicon pivot — {sh_piv.get('total','?')} total hosts, returning {n}", "type": "warn" if n else "info", "stage":"S11"})
+                yield sse("log", {"msg": f"S10: Shodan favicon pivot — {sh_piv.get('total','?')} total hosts, returning {n}", "type": "warn" if n else "info", "stage":"S10"})
                 for m in (sh_piv.get("matches") or [])[:6]:
                     hn = ",".join(m.get("hostnames") or []) or "—"
-                    yield sse("log", {"msg": f"S11: Shodan match {m.get('ip')}:{m.get('port')}  {hn}  ({m.get('org') or '?'})", "type": "warn", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Shodan match {m.get('ip')}:{m.get('port')}  {hn}  ({m.get('org') or '?'})", "type": "warn", "stage":"S10"})
             yield sse("faviconPivotShodan", sh_piv)
             # Censys
             if cs_piv.get("error"):
-                yield sse("log", {"msg": f"S11: Censys favicon pivot: {cs_piv['error']}", "type": "info", "stage":"S11"})
+                yield sse("log", {"msg": f"S10: Censys favicon pivot: {cs_piv['error']}", "type": "info", "stage":"S10"})
             else:
                 n = len(cs_piv.get("matches") or [])
-                yield sse("log", {"msg": f"S11: Censys favicon pivot — {cs_piv.get('total','?')} total hosts, returning {n}", "type": "warn" if n else "info", "stage":"S11"})
+                yield sse("log", {"msg": f"S10: Censys favicon pivot — {cs_piv.get('total','?')} total hosts, returning {n}", "type": "warn" if n else "info", "stage":"S10"})
                 for m in (cs_piv.get("matches") or [])[:6]:
                     hn = ",".join(m.get("hostnames") or []) or "—"
-                    yield sse("log", {"msg": f"S11: Censys match {m.get('ip')}  {hn}  ({m.get('asn') or '?'})", "type": "warn", "stage":"S11"})
+                    yield sse("log", {"msg": f"S10: Censys match {m.get('ip')}  {hn}  ({m.get('asn') or '?'})", "type": "warn", "stage":"S10"})
             yield sse("faviconPivotCensys", cs_piv)
         except Exception as e:
-            yield sse("log", {"msg": f"S11: Favicon pivot phase failed: {e}", "type": "warn", "stage":"S11"})
+            yield sse("log", {"msg": f"S10: Favicon pivot phase failed: {e}", "type": "warn", "stage":"S10"})
     elif not is_ip:
         # No usable favicon — emit explicit skipped events so the UI panel
         # shows the actual outcome instead of an indefinite "AWAITING" state.
@@ -2205,21 +2188,21 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
     if not result.get("shodan_per_ip"):
         yield sse("jarmPivot", {"jarms": [], "skipped": True, "error": "skipped — no Shodan host data available"})
 
-    yield sse("stage", {"n":11, "state": "done"})
+    yield sse("stage", {"n":10, "state": "done"})
 
-    # ── S20: Google Threat Intelligence (GTI) ──
+    # ── S11: Google Threat Intelligence (GTI) ──
     # Shares the VT v3 surface; relationship fields (collections / threat actors /
     # malware families / campaigns / attack techniques) populate only on keys
     # with GTI entitlement. Each populated relationship → finding.
-    yield sse("stage", {"n":12, "state": "active"})
+    yield sse("stage", {"n":11, "state": "active"})
     if VIRUSTOTAL_API_KEY:
         try:
             gti_data = await fetch_gti_intel(seed, VIRUSTOTAL_API_KEY)
             result["gti"] = gti_data
             if gti_data.get("error"):
-                yield sse("log", {"msg": f"S12: GTI: {gti_data['error']}", "type": "warn", "stage":"S12"})
+                yield sse("log", {"msg": f"S11: GTI: {gti_data['error']}", "type": "warn", "stage":"S11"})
             elif not gti_data.get("found"):
-                yield sse("log", {"msg": f"S12: GTI: {seed} not in corpus", "type": "info", "stage":"S12"})
+                yield sse("log", {"msg": f"S11: GTI: {seed} not in corpus", "type": "info", "stage":"S11"})
             else:
                 if gti_data.get("gti_enabled"):
                     summary = []
@@ -2228,24 +2211,24 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                     if gti_data.get("campaigns"): summary.append(f"{len(gti_data['campaigns'])} campaign(s)")
                     if gti_data.get("collections"): summary.append(f"{len(gti_data['collections'])} collection(s)")
                     if summary:
-                        yield sse("log", {"msg": f"S12: GTI entitlement active — {', '.join(summary)}", "type": "warn", "stage":"S12"})
+                        yield sse("log", {"msg": f"S11: GTI entitlement active — {', '.join(summary)}", "type": "warn", "stage":"S11"})
                     else:
-                        yield sse("log", {"msg": "S12: GTI entitlement active — assessment + attribution present", "type": "warn", "stage":"S12"})
+                        yield sse("log", {"msg": "S11: GTI entitlement active — assessment + attribution present", "type": "warn", "stage":"S11"})
                 else:
-                    yield sse("log", {"msg": "S12: No GTI/Mandiant signals on this seed (key may still have entitlement; this object just has none)", "type": "info", "stage":"S12"})
+                    yield sse("log", {"msg": "S11: No GTI/Mandiant signals on this seed (key may still have entitlement; this object just has none)", "type": "info", "stage":"S11"})
                 # Stream named threat actors / malware / campaigns to the log so
                 # the analyst sees them inline instead of having to dig into the
                 # findings panel.
                 for ta in (gti_data.get("threat_actors") or [])[:4]:
                     nm = ta.get("name") or ta.get("id") or "?"
                     desc = (ta.get("description") or "")[:140]
-                    yield sse("log", {"msg": f"S12: Threat actor: {nm}" + (f" — {desc}" if desc else ""), "type": "warn", "stage":"S12"})
+                    yield sse("log", {"msg": f"S11: Threat actor: {nm}" + (f" — {desc}" if desc else ""), "type": "warn", "stage":"S11"})
                 for mf in (gti_data.get("malware_families") or [])[:4]:
                     nm = mf.get("name") or mf.get("id") or "?"
-                    yield sse("log", {"msg": f"S12: Malware family: {nm}", "type": "warn", "stage":"S12"})
+                    yield sse("log", {"msg": f"S11: Malware family: {nm}", "type": "warn", "stage":"S11"})
                 for cm in (gti_data.get("campaigns") or [])[:4]:
                     nm = cm.get("name") or cm.get("id") or "?"
-                    yield sse("log", {"msg": f"S12: Campaign: {nm}", "type": "warn", "stage":"S12"})
+                    yield sse("log", {"msg": f"S11: Campaign: {nm}", "type": "warn", "stage":"S11"})
                 # Re-emit GTI's `last_dns_records` as standard dnsRecord events
                 # so the DNS RECORDS panel surfaces them even when the live S2
                 # DNS resolver returned nothing (Cloudflare-hosted apex, etc.).
@@ -2262,19 +2245,19 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 mc = gti_data.get("malicious_vendor_count", 0)
                 tc = gti_data.get("total_vendor_count", 0)
                 if mc:
-                    yield sse("log", {"msg": f"S12: {mc}/{tc} security vendors flag this seed as malicious", "type": "warn", "stage":"S12"})
+                    yield sse("log", {"msg": f"S11: {mc}/{tc} security vendors flag this seed as malicious", "type": "warn", "stage":"S11"})
                 for f in _findings_from_gti(gti_data, context_seed=seed):
                     yield sse("finding", f)
             yield sse("gti", gti_data)
         except Exception as e:
-            yield sse("log", {"msg": f"S12: GTI lookup failed: {e}", "type": "warn", "stage":"S12"})
+            yield sse("log", {"msg": f"S11: GTI lookup failed: {e}", "type": "warn", "stage":"S11"})
     else:
-        yield sse("log", {"msg": "S12: GTI skipped — VirusTotal API key not configured", "type": "info", "stage":"S12"})
-    yield sse("stage", {"n":12, "state": "done"})
+        yield sse("log", {"msg": "S11: GTI skipped — VirusTotal API key not configured", "type": "info", "stage":"S11"})
+    yield sse("stage", {"n":11, "state": "done"})
 
-    # ── S13: Additional Infrastructure Mapping ──
-    yield sse("stage",{"n":13,"state":"active"})
-    yield sse("log",{"msg":"S13: Performing reverse IP lookup expansion to map hosting provider networks","type":"live","stage":"S13"})
+    # ── S12: Additional Infrastructure Mapping ──
+    yield sse("stage",{"n":12,"state":"active"})
+    yield sse("log",{"msg":"S12: Performing reverse IP lookup expansion to map hosting provider networks","type":"live","stage":"S12"})
     
     try:
         if not feat("reverse_ip"): raise _StageDisabled
@@ -2287,17 +2270,17 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 if not reverse_data.get("error"):
                     domain_count = reverse_data.get("count", 0)
                     if domain_count > 0:
-                        yield sse("log",{"msg":f"S13: Reverse IP lookup for {ip} found {domain_count} domains","type":"ok","stage":"S13"})
+                        yield sse("log",{"msg":f"S12: Reverse IP lookup for {ip} found {domain_count} domains","type":"ok","stage":"S12"})
                         # Show first 3 domains for context
                         domains = reverse_data.get("domains", [])[:3]
                         for domain in domains:
-                            yield sse("log",{"msg":f"S13: Neighbor domain: {domain}","type":"ok","stage":"S13"})
+                            yield sse("log",{"msg":f"S12: Neighbor domain: {domain}","type":"ok","stage":"S12"})
                     else:
-                        yield sse("log",{"msg":f"S13: Reverse IP lookup for {ip} found no additional domains","type":"info","stage":"S13"})
+                        yield sse("log",{"msg":f"S12: Reverse IP lookup for {ip} found no additional domains","type":"info","stage":"S12"})
                 else:
-                    yield sse("log",{"msg":f"S13: Reverse IP lookup failed for {ip}: {reverse_data.get('error')}","type":"warn","stage":"S13"})
+                    yield sse("log",{"msg":f"S12: Reverse IP lookup failed for {ip}: {reverse_data.get('error')}","type":"warn","stage":"S12"})
             except Exception as e:
-                yield sse("log",{"msg":f"S13: Reverse IP lookup failed for {ip}: {str(e)}","type":"warn","stage":"S13"})
+                yield sse("log",{"msg":f"S12: Reverse IP lookup failed for {ip}: {str(e)}","type":"warn","stage":"S12"})
         
         # Store reverse IP data for correlation
         result["reverse_ip"] = reverse_ip_data
@@ -2320,25 +2303,25 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         
         # Log findings
         if shared_infra.get("common_ips"):
-            yield sse("log",{"msg":f"S13: Found {len(shared_infra['common_ips'])} IPs hosting multiple domains - potential shared infrastructure","type":"warn","stage":"S13"})
+            yield sse("log",{"msg":f"S12: Found {len(shared_infra['common_ips'])} IPs hosting multiple domains - potential shared infrastructure","type":"warn","stage":"S12"})
         
         if shared_infra.get("infrastructure_clusters"):
             cluster_count = len(shared_infra["infrastructure_clusters"])
-            yield sse("log",{"msg":f"S13: Identified {cluster_count} infrastructure clusters","type":"warn","stage":"S13"})
+            yield sse("log",{"msg":f"S12: Identified {cluster_count} infrastructure clusters","type":"warn","stage":"S12"})
             
         for pattern in shared_infra.get("suspicious_patterns", []):
-            yield sse("log",{"msg":f"S13: {pattern}","type":"warn","stage":"S13"})
+            yield sse("log",{"msg":f"S12: {pattern}","type":"warn","stage":"S12"})
             
     except _StageDisabled:
-        yield sse("log",{"msg":"S13: Reverse IP / infrastructure mapping disabled in settings","type":"info","stage":"S13"})
+        yield sse("log",{"msg":"S12: Reverse IP / infrastructure mapping disabled in settings","type":"info","stage":"S12"})
     except Exception as e:
-        yield sse("log",{"msg":f"S13: Infrastructure mapping failed: {str(e)}","type":"warn","stage":"S13"})
+        yield sse("log",{"msg":f"S12: Infrastructure mapping failed: {str(e)}","type":"warn","stage":"S12"})
 
-    yield sse("stage",{"n":13,"state":"done"})
+    yield sse("stage",{"n":12,"state":"done"})
 
-    # ── S14: Multi-Platform IOC Correlation ──
-    yield sse("stage",{"n":14,"state":"active"})
-    yield sse("log",{"msg":"S14: Performing Multi-Platform IOC Correlation with VirusTotal, AlienVault OTX, URLHaus","type":"live","stage":"S14"})
+    # ── S13: Multi-Platform IOC Correlation ──
+    yield sse("stage",{"n":13,"state":"active"})
+    yield sse("log",{"msg":"S13: Performing Multi-Platform IOC Correlation with VirusTotal, AlienVault OTX, URLHaus","type":"live","stage":"S13"})
     
     try:
         if not feat("correlation"): raise _StageDisabled
@@ -2366,29 +2349,30 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             high_confidence = summary.get("high_confidence_count", 0)
             medium_confidence = summary.get("medium_confidence_count", 0)
             
-            yield sse("log",{"msg":f"S14: Multi-Platform IOC Correlation complete - {correlated_count}/{total_iocs} IOCs correlated","type":"ok","stage":"S14"})
+            yield sse("log",{"msg":f"S13: Multi-Platform IOC Correlation complete - {correlated_count}/{total_iocs} IOCs correlated","type":"ok","stage":"S13"})
             
             if high_confidence > 0:
-                yield sse("log",{"msg":f"S14: !! HIGH CONFIDENCE IOC MATCHES: {high_confidence} IOCs with high confidence threat intelligence","type":"err","stage":"S14"})
+                yield sse("log",{"msg":f"S13: !! HIGH CONFIDENCE IOC MATCHES: {high_confidence} IOCs with high confidence threat intelligence","type":"err","stage":"S13"})
                 
             if medium_confidence > 0:
-                yield sse("log",{"msg":f"S14: Medium confidence IOC matches: {medium_confidence} IOCs","type":"warn","stage":"S14"})
+                yield sse("log",{"msg":f"S13: Medium confidence IOC matches: {medium_confidence} IOCs","type":"warn","stage":"S13"})
             
             # Send correlation data to frontend
             yield sse("iocCorrelation",{"correlation_results": correlation_results, "analysis": correlation_analysis})
             
         else:
-            yield sse("log",{"msg":"S14: No IOCs available for correlation","type":"info","stage":"S14"})
+            yield sse("log",{"msg":"S13: No IOCs available for correlation","type":"info","stage":"S13"})
             
     except _StageDisabled:
-        yield sse("log",{"msg":"S14: Multi-Platform IOC Correlation disabled in settings","type":"info","stage":"S14"})
+        yield sse("log",{"msg":"S13: Multi-Platform IOC Correlation disabled in settings","type":"info","stage":"S13"})
     except Exception as e:
-        yield sse("log",{"msg":f"S14: Multi-Platform IOC Correlation failed: {str(e)}","type":"warn","stage":"S14"})
+        yield sse("log",{"msg":f"S13: Multi-Platform IOC Correlation failed: {str(e)}","type":"warn","stage":"S13"})
 
-    yield sse("stage",{"n":14,"state":"done"})
+    yield sse("stage",{"n":13,"state":"done"})
 
-    yield sse("stage",{"n":15,"state":"active"})
-    yield sse("log",{"msg":"S15: Performing SSL Certificate Graph Analysis","type":"live","stage":"S15"})
+    # ── S14: SSL Certificate Graph Analysis ──
+    yield sse("stage",{"n":14,"state":"active"})
+    yield sse("log",{"msg":"S14: Performing SSL Certificate Graph Analysis","type":"live","stage":"S14"})
     
     try:
         if not feat("ssl_graph"): raise _StageDisabled
@@ -2408,48 +2392,48 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 graph = cert_analysis.get("graph", {})
                 risk_score = cert_analysis.get("risk_score", 0)
                 
-                yield sse("log",{"msg":f"S15: SSL Certificate Graph Analysis complete - Risk Score: {risk_score}/100","type":"ok","stage":"S15"})
+                yield sse("log",{"msg":f"S14: SSL Certificate Graph Analysis complete - Risk Score: {risk_score}/100","type":"ok","stage":"S14"})
                 
                 # Log certificate families
                 families = graph.get("certificate_families", [])
                 if families:
                     large_families = [f for f in families if f["family_size"] == "large"]
                     if large_families:
-                        yield sse("log",{"msg":f"S15: Found {len(large_families)} large certificate families - potential shared infrastructure","type":"warn","stage":"S15"})
+                        yield sse("log",{"msg":f"S14: Found {len(large_families)} large certificate families - potential shared infrastructure","type":"warn","stage":"S14"})
                         for family in large_families[:3]:  # Show first 3
-                            yield sse("log",{"msg":f"S15: Large family: {family['issuer']} with {family['domain_count']} domains","type":"warn","stage":"S15"})
+                            yield sse("log",{"msg":f"S14: Large family: {family['issuer']} with {family['domain_count']} domains","type":"warn","stage":"S14"})
                 
                 # Log issuer migrations
                 migrations = graph.get("issuer_migrations", [])
                 if migrations:
-                    yield sse("log",{"msg":f"S15: Found {len(migrations)} domains with issuer migration patterns","type":"warn","stage":"S15"})
+                    yield sse("log",{"msg":f"S14: Found {len(migrations)} domains with issuer migration patterns","type":"warn","stage":"S14"})
                     for migration in migrations[:3]:  # Show first 3
-                        yield sse("log",{"msg":f"S15: Domain {migration['domain']} migrated between {migration['migration_count']} issuers","type":"warn","stage":"S15"})
+                        yield sse("log",{"msg":f"S14: Domain {migration['domain']} migrated between {migration['migration_count']} issuers","type":"warn","stage":"S14"})
                 
                 # Log suspicious chains
                 suspicious = graph.get("suspicious_chains", [])
                 if suspicious:
-                    yield sse("log",{"msg":f"S15: Found {len(suspicious)} domains with suspicious certificate chains","type":"err","stage":"S15"})
+                    yield sse("log",{"msg":f"S14: Found {len(suspicious)} domains with suspicious certificate chains","type":"err","stage":"S14"})
                     for chain in suspicious[:3]:  # Show first 3
-                        yield sse("log",{"msg":f"S15: Suspicious chain: {chain['domain']} issued by '{chain['issuer']}'","type":"err","stage":"S15"})
+                        yield sse("log",{"msg":f"S14: Suspicious chain: {chain['domain']} issued by '{chain['issuer']}'","type":"err","stage":"S14"})
                 
                 # Send graph data to frontend
                 yield sse("certGraph",{"graph": graph, "risk_score": risk_score})
             else:
-                yield sse("log",{"msg":"S15: SSL Certificate Graph Analysis failed or incomplete","type":"warn","stage":"S15"})
+                yield sse("log",{"msg":"S14: SSL Certificate Graph Analysis failed or incomplete","type":"warn","stage":"S14"})
         else:
-            yield sse("log",{"msg":"S15: No certificates available for graph analysis","type":"info","stage":"S15"})
+            yield sse("log",{"msg":"S14: No certificates available for graph analysis","type":"info","stage":"S14"})
             
     except _StageDisabled:
-        yield sse("log",{"msg":"S15: SSL Certificate Graph Analysis disabled in settings","type":"info","stage":"S15"})
+        yield sse("log",{"msg":"S14: SSL Certificate Graph Analysis disabled in settings","type":"info","stage":"S14"})
     except Exception as e:
-        yield sse("log",{"msg":f"S15: SSL Certificate Graph Analysis failed: {str(e)}","type":"warn","stage":"S15"})
+        yield sse("log",{"msg":f"S14: SSL Certificate Graph Analysis failed: {str(e)}","type":"warn","stage":"S14"})
 
-    yield sse("stage",{"n":15,"state":"done"})
+    yield sse("stage",{"n":14,"state":"done"})
 
-    # ── S14: Social Media & Content Platform Fingerprinting ──
-    yield sse("stage",{"n":16,"state":"active"})
-    yield sse("log",{"msg":"S16: Performing Social Media & Content Platform Fingerprinting","type":"live","stage":"S16"})
+    # ── S15: Social Media & Content Platform Fingerprinting ──
+    yield sse("stage",{"n":15,"state":"active"})
+    yield sse("log",{"msg":"S15: Performing Social Media & Content Platform Fingerprinting","type":"live","stage":"S15"})
     
     try:
         if not feat("social_fingerprint"): raise _StageDisabled
@@ -2465,7 +2449,7 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         if social_media_data.get("analysis_complete", False):
             social_score = social_media_data.get("social_platform_score", 0)
             total_matches = social_media_data.get("total_matches", 0)
-            yield sse("log",{"msg":f"S16: Social Media Fingerprinting complete - Score: {social_score}/100, Matches: {total_matches}","type":"ok","stage":"S16"})
+            yield sse("log",{"msg":f"S15: Social Media Fingerprinting complete - Score: {social_score}/100, Matches: {total_matches}","type":"ok","stage":"S15"})
             
             # Log specific matches
             social_matches = social_media_data.get("social_media_matches", [])
@@ -2473,29 +2457,29 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
             
             if social_matches:
                 plats = ", ".join(social_media_data.get("platforms_found", [])) or "various"
-                yield sse("log",{"msg":f"S16: {len(social_matches)} real social/contact links found in homepages ({plats})","type":"warn","stage":"S16"})
+                yield sse("log",{"msg":f"S15: {len(social_matches)} real social/contact links found in homepages ({plats})","type":"warn","stage":"S15"})
                 for match in social_matches[:5]:  # Show first 5 with the actual URL
-                    yield sse("log",{"msg":f"S16: {match['domain']} → {match['platform']}: {match.get('url','')}","type":"warn","stage":"S16"})
+                    yield sse("log",{"msg":f"S15: {match['domain']} → {match['platform']}: {match.get('url','')}","type":"warn","stage":"S15"})
             else:
-                yield sse("log",{"msg":f"S16: No social/contact links found in {social_media_data.get('domains_scanned',0)} scanned homepage(s)","type":"info","stage":"S16"})
+                yield sse("log",{"msg":f"S15: No social/contact links found in {social_media_data.get('domains_scanned',0)} scanned homepage(s)","type":"info","stage":"S15"})
                     
             suspicious_patterns = social_media_data.get("suspicious_patterns", [])
             if suspicious_patterns:
-                yield sse("log",{"msg":f"S16: Found {len(suspicious_patterns)} suspicious social media patterns","type":"err","stage":"S16"})
+                yield sse("log",{"msg":f"S15: Found {len(suspicious_patterns)} suspicious social media patterns","type":"err","stage":"S15"})
                 for pattern in suspicious_patterns[:3]:  # Show first 3
-                    yield sse("log",{"msg":f"S16: Suspicious pattern: {pattern['domain']} ({pattern['pattern']})","type":"err","stage":"S16"})
+                    yield sse("log",{"msg":f"S15: Suspicious pattern: {pattern['domain']} ({pattern['pattern']})","type":"err","stage":"S15"})
         
         if content_similarity_data.get("analysis_complete", False):
             similarity_score = content_similarity_data.get("content_similarity_score", 0)
             group_count = len(content_similarity_data.get("similarity_groups", {}))
-            yield sse("log",{"msg":f"S16: Content Similarity Mapping complete - Score: {similarity_score}/100, Groups: {group_count}","type":"ok","stage":"S16"})
+            yield sse("log",{"msg":f"S15: Content Similarity Mapping complete - Score: {similarity_score}/100, Groups: {group_count}","type":"ok","stage":"S15"})
             
             # Log similarity groups
             similarity_groups = content_similarity_data.get("similarity_groups", {})
             if similarity_groups:
-                yield sse("log",{"msg":f"S16: Found {len(similarity_groups)} content similarity groups","type":"warn","stage":"S16"})
+                yield sse("log",{"msg":f"S15: Found {len(similarity_groups)} content similarity groups","type":"warn","stage":"S15"})
                 for pattern, domains in list(similarity_groups.items())[:3]:  # Show first 3 groups
-                    yield sse("log",{"msg":f"S16: Similarity group '{pattern}': {len(domains)} domains","type":"warn","stage":"S16"})
+                    yield sse("log",{"msg":f"S15: Similarity group '{pattern}': {len(domains)} domains","type":"warn","stage":"S15"})
                     
         # Send data to frontend
         yield sse("socialMediaData",{
@@ -2504,16 +2488,16 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         })
         
     except _StageDisabled:
-        yield sse("log",{"msg":"S16: Social Media & Content Platform Fingerprinting disabled in settings","type":"info","stage":"S16"})
+        yield sse("log",{"msg":"S15: Social Media & Content Platform Fingerprinting disabled in settings","type":"info","stage":"S15"})
     except Exception as e:
-        yield sse("log",{"msg":f"S16: Social Media & Content Platform Fingerprinting failed: {str(e)}","type":"warn","stage":"S16"})
+        yield sse("log",{"msg":f"S15: Social Media & Content Platform Fingerprinting failed: {str(e)}","type":"warn","stage":"S15"})
 
-    yield sse("stage",{"n":16,"state":"done"})
+    yield sse("stage",{"n":15,"state":"done"})
 
 
     # ── S16: Recursive Subdomain Discovery ──
-    yield sse("stage",{"n":17,"state":"active"})
-    yield sse("log",{"msg":"S17: Performing Recursive Subdomain Discovery & Brute-forcing","type":"live","stage":"S17"})
+    yield sse("stage",{"n":16,"state":"active"})
+    yield sse("log",{"msg":"S16: Performing Recursive Subdomain Discovery & Brute-forcing","type":"live","stage":"S16"})
     
     try:
         # Check if subdomain discovery is enabled in settings
@@ -2525,7 +2509,7 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         if not subdomain_data.get("error"):
             subdomain_count = subdomain_data.get("subdomain_count", 0)
             if subdomain_count > 0:
-                yield sse("log",{"msg":f"S17: Discovered {subdomain_count} additional subdomains through recursive enumeration","type":"ok","stage":"S17"})
+                yield sse("log",{"msg":f"S16: Discovered {subdomain_count} additional subdomains through recursive enumeration","type":"ok","stage":"S16"})
                 
                 # Add newly discovered subdomains to the domain list
                 new_subdomains = subdomain_data.get("subdomains", [])
@@ -2543,9 +2527,9 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 # Report admin interfaces
                 admin_interfaces = subdomain_data.get("admin_interfaces", [])
                 if admin_interfaces:
-                    yield sse("log",{"msg":f"S17: !! ADMIN/CONTROL PANELS DETECTED: {len(admin_interfaces)} interfaces found","type":"err","stage":"S17"})
+                    yield sse("log",{"msg":f"S16: !! ADMIN/CONTROL PANELS DETECTED: {len(admin_interfaces)} interfaces found","type":"err","stage":"S16"})
                     for interface in admin_interfaces[:5]:  # Show first 5
-                        yield sse("log",{"msg":f"S17: Admin interface: {interface['subdomain']} ({interface['type']})","type":"err","stage":"S17"})
+                        yield sse("log",{"msg":f"S16: Admin interface: {interface['subdomain']} ({interface['type']})","type":"err","stage":"S16"})
                 
                 # Report internal infrastructure
                 internal_infra = subdomain_data.get("internal_infrastructure", {})
@@ -2554,34 +2538,62 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
                 internal_count = len(internal_infra.get("internal", []))
                 
                 if neibu_count > 0:
-                    yield sse("log",{"msg":f"S17: !! NEIBU 内部 ADMIN PANELS: {neibu_count} Chinese-dev admin interfaces detected","type":"err","stage":"S17"})
+                    yield sse("log",{"msg":f"S16: !! NEIBU 内部 ADMIN PANELS: {neibu_count} Chinese-dev admin interfaces detected","type":"err","stage":"S16"})
                 if kyc_count > 0:
-                    yield sse("log",{"msg":f"S17: KYC Infrastructure: {kyc_count} Know Your Customer systems detected","type":"warn","stage":"S17"})
+                    yield sse("log",{"msg":f"S16: KYC Infrastructure: {kyc_count} Know Your Customer systems detected","type":"warn","stage":"S16"})
                 if internal_count > 0:
-                    yield sse("log",{"msg":f"S17: Internal Infrastructure: {internal_count} internal systems detected","type":"warn","stage":"S17"})
+                    yield sse("log",{"msg":f"S16: Internal Infrastructure: {internal_count} internal systems detected","type":"warn","stage":"S16"})
                 
                 # Send subdomain discovery data to frontend
                 yield sse("subdomainDiscovery",{"data": subdomain_data})
                 yield sse("chip",{"id":"subdomain","state":"live"})
             else:
-                yield sse("log",{"msg":"S17: No additional subdomains discovered through recursive enumeration","type":"info","stage":"S17"})
+                yield sse("log",{"msg":"S16: No additional subdomains discovered through recursive enumeration","type":"info","stage":"S16"})
                 yield sse("chip",{"id":"subdomain","state":"pend"})
         else:
-            yield sse("log",{"msg":f"S17: Subdomain discovery failed: {subdomain_data.get('error')}","type":"warn","stage":"S17"})
+            yield sse("log",{"msg":f"S16: Subdomain discovery failed: {subdomain_data.get('error')}","type":"warn","stage":"S16"})
             yield sse("chip",{"id":"subdomain","state":"fail"})
             
     except _StageDisabled:
-        yield sse("log",{"msg":"S17: Recursive Subdomain Discovery disabled in settings","type":"info","stage":"S17"})
+        yield sse("log",{"msg":"S16: Recursive Subdomain Discovery disabled in settings","type":"info","stage":"S16"})
         yield sse("chip",{"id":"subdomain","state":"pend"})
     except Exception as e:
-        yield sse("log",{"msg":f"S17: Recursive Subdomain Discovery failed: {str(e)}","type":"warn","stage":"S17"})
+        yield sse("log",{"msg":f"S16: Recursive Subdomain Discovery failed: {str(e)}","type":"warn","stage":"S16"})
         yield sse("chip",{"id":"subdomain","state":"fail"})
 
-    yield sse("stage",{"n":17,"state":"done"})
+    yield sse("stage",{"n":16,"state":"done"})
 
-    # S17 (Threat Actor Attribution) was removed — its local pattern matcher
-    # only knew the DSJ-Exchange fingerprint set, so it almost never fired.
-    # GTI/Mandiant attribution in S20 queries a real corpus and replaces it.
+    # ── S17: Neighbor CT enrichment ──
+    # Cert-transparency on each reverse-IP and reverse-NS neighbor. Surfaces when
+    # neighbors first showed up in CT logs — issuance bursts across neighbors are
+    # a campaign signal even when the individual names look unrelated.
+    yield sse("stage",{"n":17,"state":"active"})
+    yield sse("log",{"msg":"S17: CT enrichment on neighbor / IP-hosted domains","type":"live","stage":"S17"})
+    try:
+        neighbor_pool: list[str] = []
+        seed_norm = (seed or "").lower().strip(".")
+        for entry in result.get("reverse_ip", []) or []:
+            if entry.get("error"): continue
+            for d in (entry.get("domains") or []):
+                if d and d.lower() != seed_norm:
+                    neighbor_pool.append(d)
+        for row in ((result.get("reverse_ns") or {}).get("flat") or []):
+            host = row.get("hostname")
+            if host and host.lower() != seed_norm:
+                neighbor_pool.append(host)
+        if neighbor_pool:
+            ct_summaries = await enrich_neighbors_with_ct(neighbor_pool, limit=25)
+            result["neighbor_ct"] = ct_summaries
+            if ct_summaries:
+                yield sse("neighborCt", {"summaries": ct_summaries})
+                yield sse("log",{"msg":f"S17: CT enrichment found certs for {len(ct_summaries)}/{min(25,len(neighbor_pool))} neighbor domains","type":"ok","stage":"S17"})
+            else:
+                yield sse("log",{"msg":"S17: CT enrichment — no neighbor domains had certspotter coverage","type":"info","stage":"S17"})
+        else:
+            yield sse("log",{"msg":"S17: CT enrichment skipped — no neighbor domains to enrich","type":"info","stage":"S17"})
+    except Exception as e:
+        yield sse("log",{"msg":f"S17: CT enrichment failed: {e}","type":"warn","stage":"S17"})
+    yield sse("stage",{"n":17,"state":"done"})
 
     # Close the self-tracking scan row so future diff queries can find it.
     try:
@@ -2697,17 +2709,11 @@ async def api_certs(domain: str):
         return JSONResponse({"error":f"Certificate transparency sources unavailable: {e}"},status_code=502)
     return JSONResponse({"count":len(certs),"certs":certs[:200]})
 
-@app.get("/api/urlscan/{domain}")
-async def api_urlscan(domain: str):
-    validated, kind = validate_seed(domain)
-    if not validated or kind!="domain": return JSONResponse({"error":"Invalid domain"},status_code=400)
+@app.get("/api/urlscan/{seed}")
+async def api_urlscan(seed: str):
+    validated, kind = validate_seed(seed)
+    if not validated: return JSONResponse({"error":"Invalid domain or IP"},status_code=400)
     return JSONResponse(await fetch_urlscan(validated))
-
-@app.get("/api/jsscan/{domain}")
-async def api_jsscan(domain: str):
-    validated, kind = validate_seed(domain)
-    if not validated or kind!="domain": return JSONResponse({"error":"Invalid domain"},status_code=400)
-    return JSONResponse(await scan_js_for_wallet_drain(validated))
 
 @app.get("/api/shodan/{ip}")
 async def api_shodan(ip: str):

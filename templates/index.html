@@ -571,7 +571,6 @@ body.theme-light .vt-badge.vt-malicious:hover{background:rgba(192,21,42,.06);}
         <li><strong>IP Intelligence:</strong> Enriches resolved IPs with ISP, ASN, country, and hosting-type detection. Surfaces bulletproof hosting, CDN/proxy masking (Cloudflare, AWS Global Accelerator, Fastly), and hosting ASNs over-represented in adversary infrastructure.</li>
         <li><strong>RDAP Registration:</strong> Registrar, creation date, status flags, nameservers. Surfaces registrars over-represented in malicious registrations and fresh domains (&lt;90 days).</li>
         <li><strong>urlscan.io Corroboration:</strong> Historical scans, additional IPs/ASNs from browser-based scanning. High scan count = well-known bad domain.</li>
-        <li><strong>JS Bundle Scan:</strong> Fetches the live domain and linked JS bundles for adversary-pattern signatures — credential-harvest forms, web skimmer code, exfil endpoints, EVM/TRX wallet drain primitives (MAX_UINT <code>approve()</code>), and iOS .mobileconfig bypass patterns.</li>
         <li><strong>Cert Issuance Timeline:</strong> Time-series of cert issuance across the cluster. Bursts of simultaneous issuance = automated kit spin-up; staggered issuance = organic growth.</li>
         <li><strong>Neighbor Domains:</strong> Reverse-IP lookup. Other domains hosted on the same IP — often co-located adversary infrastructure. Click any row to pivot.</li>
         <li><strong>ThreatFox / OTX Cross-Reference:</strong> Checks abuse.ch ThreatFox and AlienVault OTX for documented IOCs on the seed or its IPs. Direct hits are decisive evidence.</li>
@@ -753,7 +752,6 @@ body.theme-light .vt-badge.vt-malicious:hover{background:rgba(192,21,42,.06);}
         <li><strong>Pluggable CT providers:</strong> scantower.io and Cloudflare Radar are configured per-provider with an API key + URL template containing <code>{q}</code>. CRUCIBLE GETs that URL with <code>Authorization: Bearer &lt;key&gt;</code> and extracts domain-like names from the JSON.</li>
         <li><strong>CT source order:</strong> Cert Spotter is primary, certkit.io and crt.sh are fallbacks, Censys runs when keyed. A crt.sh outage no longer breaks discovery.</li>
         <li><strong>crt.sh flakiness:</strong> Single Postgres instance, goes down under load. If all CT sources fail simultaneously, retry in 5–10 minutes.</li>
-        <li><strong>JS scan limitations:</strong> Domains behind Cloudflare bot protection may block the fetch. The scan is opportunistic, not guaranteed.</li>
         <li><strong>Rate limits:</strong> freeipapi.com and urlscan.io have free-tier limits. The tool includes 300ms delays between IP lookups to respect them.</li>
         <li><strong>Revalidation:</strong> Checks are passive (DNS / IP / ASN). Frequency is per-domain in hours; the scheduler runs on demand or on a fixed cadence when enabled in SETTINGS. Decay alerts surface NXDOMAIN, IP/ASN drift, and reactivation.</li>
         <li><strong>No active probing:</strong> CRUCIBLE never sends exploit payloads, port scans, or authenticated requests. All data comes from passive sources and the live domain's public HTTP interface.</li>
@@ -1383,6 +1381,10 @@ let running=false;
 let domainCount=0,dnsCount=0,ipCount=0;
 let ipResults=[];  // collected per-IP intel for the IP INTELLIGENCE dropdown
 let urlscanResults=null;  // collected urlscan data for the domain dropdown
+// CT enrichment for neighbor domains — populated by the S18 neighborCt SSE event
+// and read by renderNeighborPanel. Module-level so the panel renderer (declared
+// outside the SSE handler closure) can see it.
+let neighborCtMap={};
 
 // EPP status code glossary — hover-text for STATUS fields in RDAP panel
 // and domain-detail modal. Every gTLD domain goes through the Extensible
@@ -1509,7 +1511,7 @@ function renderUrlscanDomain(idx){
 // STANDARD PIPELINE — SSE
 // ════════════════════════════════
 // Standard-pipeline progress banner. Driven by the `stage` field on log events
-// (S1…S20) rather than the raw numeric stage events, which are unreliably numbered.
+// (S1…S17) — keep this aligned with the stage numbering in crucible_app.py.
 const STD_STAGE_LABELS = {
   INIT:'Initializing pipeline',
   S1:'Certificate transparency',
@@ -1518,17 +1520,17 @@ const STD_STAGE_LABELS = {
   S4:'ASN intelligence',
   S5:'Registration (RDAP)',
   S6:'urlscan.io corroboration',
-  S7:'JS wallet-drain scan',
-  S8:'Shodan',
-  S9:'Passive DNS (VT / OTX / CIRCL / Mnemonic / self-tracking)',
-  S10:'ThreatFox + OTX cross-reference',
-  S11:'Platform pivots',
-  S12:'Google Threat Intelligence',
-  S13:'Reverse IP mapping',
-  S14:'IOC correlation',
-  S15:'SSL certificate graph',
-  S16:'Social media fingerprinting',
-  S17:'Subdomain discovery'
+  S7:'Shodan',
+  S8:'Passive DNS (VT / OTX / CIRCL / Mnemonic / self-tracking)',
+  S9:'ThreatFox + OTX cross-reference',
+  S10:'Platform pivots',
+  S11:'Google Threat Intelligence',
+  S12:'Reverse IP mapping',
+  S13:'IOC correlation',
+  S14:'SSL certificate graph',
+  S15:'Social media fingerprinting',
+  S16:'Subdomain discovery',
+  S17:'CT enrichment on neighbors'
 };
 const STD_STAGE_ORDER = Object.keys(STD_STAGE_LABELS);
 let stdScanMaxIdx = -1;
@@ -1569,7 +1571,7 @@ async function startPipeline(){
     document.getElementById('runIndicator').textContent='INVALID INPUT';
     return;
   }
-  running=true;stdResult=null;domainCount=0;dnsCount=0;ipCount=0;ipResults=[];urlscanResults=null;
+  running=true;stdResult=null;domainCount=0;dnsCount=0;ipCount=0;ipResults=[];urlscanResults=null;neighborCtMap={};
   {const s=document.getElementById('ipSelect');if(s){s.innerHTML='';s.style.display='none';}}
   {const s=document.getElementById('urlscanDomainSelect');if(s){s.innerHTML='';s.style.display='none';}}
   document.getElementById('execBtn').disabled=true;
@@ -1605,7 +1607,8 @@ async function startPipeline(){
   // clearly so an IP scan doesn't look broken.
   if(classifySeed(seed)==='ip'){
     [['dnsBody','N/A — IP SEED (NO DNS RECORDS OF ITS OWN)'],
-     ['rdapBody','N/A — IP SEED (NO REGISTRATION RECORD)']].forEach(([id,msg])=>{
+     ['rdapBody','N/A — IP SEED (NO REGISTRATION RECORD)'],
+     ['pivotBody','N/A — IP SEED (FAVICON / BODY / JARM / NS PIVOTS REQUIRE A DOMAIN)']].forEach(([id,msg])=>{
       const el=document.getElementById(id);if(el)el.innerHTML=`<div class="empty">${msg}</div>`;
     });
   }
@@ -1803,11 +1806,18 @@ async function startPipeline(){
     const d=JSON.parse(e.data);
     document.getElementById('infraPanel').classList.add('has');
     ipResults.push(d);
-    // Populate / update the IP selector — each option shows the IP and the domain(s) it serves.
+    // Populate / update the IP selector. For a domain seed, each option shows
+    // the IP and the domain(s) it serves; for an IP seed the "← domain" suffix
+    // is redundant (the seed IS the IP) so show only the IP and let the
+    // DOMAINS SERVED section in the detail panel carry that.
     const sel=document.getElementById('ipSelect');sel.style.display='block';
     const opt=document.createElement('option');opt.value=String(ipResults.length-1);
-    const dn=(d.domains&&d.domains.length)?(d.domains.length>1?`${d.domains[0]} +${d.domains.length-1} more`:d.domains[0]):'?';
-    opt.textContent=`${d.ip}  ←  ${dn}`;
+    if(_seedIsIp){
+      opt.textContent=d.ip;
+    } else {
+      const dn=(d.domains&&d.domains.length)?(d.domains.length>1?`${d.domains[0]} +${d.domains.length-1} more`:d.domains[0]):'?';
+      opt.textContent=`${d.ip}  ←  ${dn}`;
+    }
     sel.appendChild(opt);
     ipCount++;document.getElementById('infraCount').textContent=`${ipCount} IP`;
     if(ipResults.length===1){sel.value='0';renderIpDetail(0);}
@@ -2104,7 +2114,7 @@ async function startPipeline(){
         _kv(body, 'TRACKERS', 'none extracted');
       }
     } else {
-      _kv(body, 'FINGERPRINT', 'awaiting');
+      _kv(body, 'FINGERPRINT', _seedIsIp ? 'n/a — IP seed (no HTML to fetch)' : 'awaiting');
     }
 
     // ── JARM ──
@@ -2154,7 +2164,9 @@ async function startPipeline(){
         ? `SHODAN FAVICON PIVOT — ${sh.error || 'skipped'}`
         : `SHODAN FAVICON PIVOT — ${sh.total||shCount} match${(sh.total||shCount)===1?'':'es'}`;
     } else {
-      shH.textContent = `SHODAN FAVICON PIVOT — awaiting`;
+      shH.textContent = _seedIsIp
+        ? `SHODAN FAVICON PIVOT — n/a (IP seed — favicon hash requires a domain)`
+        : `SHODAN FAVICON PIVOT — awaiting`;
     }
     body.appendChild(shH);
     for(const m of (sh.matches||[]).slice(0, 25)){
@@ -2181,7 +2193,9 @@ async function startPipeline(){
         ? `CENSYS FAVICON PIVOT — ${cs.error || 'skipped'}`
         : `CENSYS FAVICON PIVOT — ${cs.total||csCount} match${(cs.total||csCount)===1?'':'es'}`;
     } else {
-      csH.textContent = `CENSYS FAVICON PIVOT — awaiting`;
+      csH.textContent = _seedIsIp
+        ? `CENSYS FAVICON PIVOT — n/a (IP seed — favicon hash requires a domain)`
+        : `CENSYS FAVICON PIVOT — awaiting`;
     }
     body.appendChild(csH);
     for(const m of (cs.matches||[]).slice(0, 25)){
@@ -2207,6 +2221,8 @@ async function startPipeline(){
       nsH.textContent = (ns.skipped || ns.error)
         ? `REVERSE-NS SISTERS — ${ns.error || 'skipped'}`
         : `REVERSE-NS SISTERS — ${nsCount} domain${nsCount===1?'':'s'}`;
+    } else if(_seedIsIp){
+      nsH.textContent = `REVERSE-NS SISTERS — n/a (IP seed — nameserver pivot requires a domain)`;
     } else {
       nsH.textContent = `REVERSE-NS SISTERS — awaiting`;
     }
@@ -2356,6 +2372,16 @@ async function startPipeline(){
     const d=JSON.parse(e.data);
     if(!d.entries || !d.entries.length) return;
     neighborState.reverseIp = d.entries;
+    renderNeighborMerged();
+  });
+
+  // S18 — per-domain certificate-transparency summary for reverse-IP + reverse-NS
+  // neighbors. Re-renders the neighbor panel so each row picks up the CT badge.
+  es.addEventListener('neighborCt',e=>{
+    const d=JSON.parse(e.data);
+    for(const s of (d.summaries || [])){
+      if(s && s.domain) neighborCtMap[s.domain.toLowerCase()] = s;
+    }
     renderNeighborMerged();
   });
 
@@ -2638,11 +2664,28 @@ function renderNeighborPanel(entries){
     // opens cleanly without triggering the domain detail modal.
     vt.addEventListener('click', e=>e.stopPropagation());
     row.appendChild(vt);
+    // CT enrichment badge — populated by the S18 neighborCt event. Shows cert
+    // count and first-seen date so the analyst can spot issuance bursts across
+    // neighbors that look unrelated by name.
+    const ctInfo = neighborCtMap[dom.name.toLowerCase()];
+    if(ctInfo){
+      const ct=document.createElement('span');
+      ct.className='badge';
+      ct.style.cssText='color:var(--cyan);border-color:var(--cyan);';
+      ct.textContent=`CT ${ctInfo.cert_count}`;
+      ct.title=`Certificate Transparency: ${ctInfo.cert_count} cert${ctInfo.cert_count===1?'':'s'} · first ${ctInfo.first_seen||'?'} · last ${ctInfo.last_seen||'?'}`;
+      ct.addEventListener('click', e=>e.stopPropagation());
+      row.appendChild(ct);
+    }
     body.appendChild(row);
     // Reasoning caption (smaller, second line in the same row group)
     const reason=document.createElement('div');
     reason.style.cssText='font-family:var(--body);font-size:10px;color:var(--text-dim);padding:2px 10px 6px 10px;border-bottom:1px solid rgba(30,45,74,.4);line-height:1.5;';
-    reason.innerHTML=_neighborReason(dom.name, ipArr, totalShared, scoreInfo).join(' · ');
+    const reasonParts=_neighborReason(dom.name, ipArr, totalShared, scoreInfo);
+    if(ctInfo){
+      reasonParts.push(`CT: ${ctInfo.cert_count} cert${ctInfo.cert_count===1?'':'s'}${ctInfo.first_seen?`, first ${ctInfo.first_seen}`:''}${ctInfo.last_seen&&ctInfo.last_seen!==ctInfo.first_seen?`, last ${ctInfo.last_seen}`:''}`);
+    }
+    reason.innerHTML=reasonParts.join(' · ');
     body.appendChild(reason);
     // Click → full domain detail modal
     row.addEventListener('click',()=>{ if(typeof openDomainModal==='function') openDomainModal(dom.name); });

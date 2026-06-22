@@ -37,21 +37,21 @@ Stages flow sequentially in execution order:
 | **S4** | ASN Intelligence | ipapi + local ASN DB | Hosting provider patterns, known malicious ASNs |
 | **S5** | RDAP Registration | rdap.org | Registrar, creation date, status flags |
 | **S6** | urlscan.io | urlscan.io | Historical scan count, additional IPs, ASNs |
-| **S7** | JS Bundle Scan | Live domain fetch | MAX_UINT wallet drain, ERC-20/TRC-20, mobileconfig |
-| **S8** | Shodan | shodan.io | Open ports, historical IPs, device/server banners |
-| **S9** | Passive DNS Aggregator | VT + OTX + CIRCL + Mnemonic + self-tracking | Historical IP resolution **with normalized ISO timestamps**, per-source provenance, vendor verdict |
-| **S10** | ThreatFox + OTX Cross-Reference | abuse.ch + OTX | Malware-family attribution, pulse memberships, sister domains |
-| **S11** | Platform Pivots | favicon mmh3 / body hash / JARM / reverse-NS | Shodan + Censys reverse-pivot fingerprints; identical JARMs collapse to one entry with endpoint list |
-| **S12** | Google Threat Intelligence | GTI / Mandiant | Threat actors, campaigns, collections, DNS fallback when live resolution fails |
-| **S13** | Reverse IP Mapping | HackerTarget | Neighbor domains, shared-hosting patterns |
-| **S14** | IOC Correlation | Multi-source | Cross-platform IOC matches |
-| **S15** | SSL Certificate Graph | crt.sh extended | Issuance patterns, shared-infra clusters |
-| **S16** | Social Media Fingerprinting | Domain-name analysis | Social media / content platform presence, content similarity |
-| **S17** | Subdomain Discovery | CT + VT + HTML + DNS brute | Subdomains via four parallel sources, per-domain evidence |
+| **S7** | Shodan | shodan.io | Open ports, historical IPs, device/server banners |
+| **S8** | Passive DNS Aggregator | VT + OTX + CIRCL + Mnemonic + self-tracking | Historical IP resolution **with normalized ISO timestamps**, per-source provenance, vendor verdict |
+| **S9** | ThreatFox + OTX Cross-Reference | abuse.ch + OTX | Malware-family attribution, pulse memberships, sister domains |
+| **S10** | Platform Pivots | favicon mmh3 / body hash / JARM / reverse-NS | Shodan + Censys reverse-pivot fingerprints; identical JARMs collapse to one entry with endpoint list |
+| **S11** | Google Threat Intelligence | GTI / Mandiant | Threat actors, campaigns, collections, DNS fallback when live resolution fails |
+| **S12** | Reverse IP Mapping | HackerTarget | Neighbor domains, shared-hosting patterns |
+| **S13** | IOC Correlation | Multi-source | Cross-platform IOC matches |
+| **S14** | SSL Certificate Graph | crt.sh extended | Issuance patterns, shared-infra clusters |
+| **S15** | Social Media Fingerprinting | Domain-name analysis | Social media / content platform presence, content similarity |
+| **S16** | Subdomain Discovery | CT + VT + HTML + DNS brute | Subdomains via four parallel sources, per-domain evidence |
+| **S17** | Neighbor CT Enrichment | certspotter | Per-domain certificate-transparency summary on reverse-IP + reverse-NS neighbors (cert count, first/last seen) |
 
 After every scan completes, a **DIFF** event compares the run to the most recent prior scan of the same seed and reports added / removed / stable IPs and per-IP source-coverage changes.
 
-The pipeline also runs structural-pattern analysis on fetched JS (`crucible.js_compromise_detector`), exposes a YARA retrohunt-rule generator (`crucible.yara_retrohunt_generator`), and provides standalone HTTP endpoints for ad-hoc lookups: `/api/ip/{ip}/hosted-intel`, `/api/gti/{seed}`, `/api/subdomain/{domain}`, `/api/pdns/{domain}`, `/api/diff/{seed}`.
+The pipeline provides standalone HTTP endpoints for ad-hoc lookups: `/api/ip/{ip}/hosted-intel`, `/api/gti/{seed}`, `/api/subdomain/{domain}`, `/api/pdns/{domain}`, `/api/diff/{seed}`.
 
 ---
 
@@ -83,7 +83,7 @@ Per-IP source-provenance chips (`VT` / `OTX` / `URLS` / `LIVE` / `CIRCL` / `MNEM
 
 ## Multi-Source Passive DNS
 
-S9 aggregates seven distinct sources into the single HOSTING IP HISTORY view. Coverage compounds because the sources have different gaps:
+S8 aggregates seven distinct sources into the single HOSTING IP HISTORY view. Coverage compounds because the sources have different gaps:
 
 | Source | Coverage strength | Carries timestamps |
 |--------|-------------------|--------------------|
@@ -124,33 +124,6 @@ GET /api/diff/{seed}           # diff latest scan vs. previous (or specified pri
 - **Source-coverage changes per IP** — gained or lost which passive-DNS sources
 
 Diff fires automatically at the end of every pipeline run (an SSE `diff` event + a `DIFF:` log line) when there's a prior completed scan of the same seed. Also available as a standalone endpoint at `/api/diff/{seed}`.
-
----
-
-## JS Compromise Detector
-
-Standalone module (`js_compromise_detector.py`) that fetches a domain's homepage + first-party scripts and applies ~40 deterministic patterns plus two structural checks (entropy delta, single-line inject) to detect indicators consistent with compromised-website families:
-
-- **SocGholish / FakeUpdates** — document.write loaders, fake-update lure copy
-- **Parrot TDS / NDSW** — ndsw/ndsx variable convention + obfuscation chains
-- **Balada Injector** — WordPress `wp_create_user` calls
-- **ClearFake / EtherHiding** — fake-browser-update overlays + `ethereum.request` + `eth_call`
-- **KongTuke / ClickFix** — `clipboard.writeText` paired with verify-human lures
-- **Keitaro / BlackTDS** — fingerprint-then-redirect, click-tracking parameter conventions
-- **Generic behaviors** — atob+eval chains, `navigator.webdriver` checks, canvas fingerprinting, visitor-gating storage, devtools detection
-
-Composite score gates LLM escalation: only the ambiguous band (`2.0–5.0`) optionally invokes a Protocol-based LLM client; clean and high-confidence verdicts skip the LLM entirely (deterministic, auditable, cheap).
-
----
-
-## YARA Retrohunt Generator
-
-Companion module (`yara_retrohunt_generator.py`) that converts `triggered_patterns` output from the detector into VirusTotal-retrohunt-compatible YARA rules. For each input pattern, emits two variants:
-
-- **tight** — strict, requires ≥ 2 campaign-specific literals + `filesize < 500KB` structural anchor
-- **loose** — behavioral, requires ≥ 2 total signals (literals + behavioral tokens) + negative anchors against jQuery / React / GA-GTM / fb-pixel / Cloudflare / Stripe / Intercom fingerprints to suppress legit-JS false positives
-
-Each rule carries family attribution inferred from the pattern's tags (parrot-tds → `parrot_tds`, socgholish → `socgholish`, …), Mandiant MITRE ATT&CK references, and a per-rule `expected_volume_estimate` in the returned manifest.
 
 ---
 
@@ -257,9 +230,6 @@ crucible-sigint/
 ├── ioc_correlation_engine.py         # Cross-source IOC correlation
 ├── pdns_store.py                     # SQLite self-tracking passive-DNS index
 ├── diff_engine.py                    # Scan-to-scan diff (added/removed/stable IPs, source changes)
-├── js_compromise_detector.py         # Standalone: JS compromise pattern analyser
-├── js_compromise_detector_classes.py # Public dataclasses for downstream consumers
-├── yara_retrohunt_generator.py       # Standalone: tight/loose YARA from triggered_patterns
 ├── automated_revalidation.py         # Server-side revalidation (UI removed; API retained)
 ├── templates/
 │   └── index.html                    # Full frontend — modes, panels, exports
@@ -275,18 +245,17 @@ crucible-sigint/
 This release is a substantial refactor of the original v5.1 pipeline:
 
 - **Sequential stage numbering** — pipeline now flows S1 → S17 in execution order; no gaps, no duplicates
-- **S9 unified passive-DNS aggregator** — VT + OTX + CIRCL + Mnemonic + self-tracking surface in one panel with per-source provenance and ISO timestamps
+- **S8 unified passive-DNS aggregator** — VT + OTX + CIRCL + Mnemonic + self-tracking surface in one panel with per-source provenance and ISO timestamps
 - **CIRCL.lu + Mnemonic integration** — two new external passive-DNS sources, both carrying timestamps; strong EU / Nordic visibility
 - **Self-tracking passive DNS (SQLite)** — Crucible records every observation it makes; future scans compound into a private passive-DNS index
 - **Diff engine** — automatic scan-to-scan comparison at pipeline completion + standalone `/api/diff/{seed}` endpoint
-- **S12 Google Threat Intelligence** — Mandiant threat actors, campaigns, collections; per-relationship querying with graceful fallback; DNS fallback when live resolution fails
+- **S11 Google Threat Intelligence** — Mandiant threat actors, campaigns, collections; per-relationship querying with graceful fallback; DNS fallback when live resolution fails
 - **CRITICAL FINDINGS panel** — structured-event channel with clickable permalinks; severity-tiered rendering above the execution log
 - **HOSTING IP HISTORY panel** — replaces IP Intelligence; per-IP ACTIVE NOW / LAST HOSTED status with cross-source provenance
 - **JARM fingerprint grouping** — identical fingerprints across an IP's port surface collapse to one row with endpoint list
 - **Date normalisation** — `_normalize_ts()` at every TI source boundary handles Unix-epoch ints, ISO strings, ThreatFox `YYYY-MM-DD HH:MM:SS UTC` format
 - **Subdomain enumeration** — four parallel sources (CT + VT passive DNS + HTML scrape + DNS brute force) with per-subdomain evidence and label-anchored filtering
-- **JS Compromise Detector + YARA Retrohunt Generator** — two new standalone modules for analysing compromised websites and generating downstream YARA hunt rules
-- **Removed** — legacy local threat-actor pattern matcher (S17 in old numbering) was superseded by GTI; revalidation watchlist UI was removed (server-side endpoints retained)
+- **Removed** — legacy local threat-actor pattern matcher (S17 in old numbering) was superseded by GTI; revalidation watchlist UI was removed (server-side endpoints retained); S7 JS bundle / wallet-drain scan and JS Compromise Detector + YARA Retrohunt Generator modules removed
 
 ---
 
@@ -296,7 +265,7 @@ This release is a substantial refactor of the original v5.1 pipeline:
 
 **NEATLABS™** — built as part of the NEATLABS open intelligence tooling initiative. CRUCIBLE joins a portfolio of free practitioner-grade tools at [neatlabs.ai](https://neatlabs.ai).
 
-**Claude (Anthropic)** — the June 2026 refactor (S9 unified passive-DNS aggregator, S10/S11/S12 expansion, CRITICAL FINDINGS surface, HOSTING IP HISTORY redesign, JS Compromise Detector and YARA Retrohunt Generator modules, cross-source date normalisation, JARM grouping, GTI integration fixes, CIRCL + Mnemonic integration, SQLite self-tracking PDNS, diff engine, sequential stage renumbering) was implemented pair-style with Claude Code (Opus 4.7). Architectural direction, validation against live infrastructure, and final review of each change remained with the project author.
+**Claude (Anthropic)** — the June 2026 refactor (S8 unified passive-DNS aggregator, S9/S10/S11 expansion, CRITICAL FINDINGS surface, HOSTING IP HISTORY redesign, cross-source date normalisation, JARM grouping, GTI integration fixes, CIRCL + Mnemonic integration, SQLite self-tracking PDNS, diff engine, sequential stage renumbering) was implemented pair-style with Claude Code (Opus 4.7). Architectural direction, validation against live infrastructure, and final review of each change remained with the project author.
 
 ---
 
