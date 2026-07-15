@@ -9,8 +9,10 @@ This module contains extensions for:
 """
 
 import asyncio
+import csv
 import datetime as _dt
 import httpx
+import io
 import ipaddress
 import os
 import re
@@ -1773,6 +1775,265 @@ async def fetch_gti_intel(seed: str, api_key: str) -> dict:
         }
     except Exception as e:
         return {"error": f"GTI fetch failed: {e}", "gti_enabled": False}
+
+
+# ────────────────────────────────────────────────────────────────────
+# VT Intelligence Search bulk export — runs an arbitrary VT search query
+# (e.g. `entity:domain domain_regex:"passkey*" creation_date:2026-04-20+`)
+# to completion and flattens every hit into one CSV-ready row. Requires a
+# VT Enterprise / GTI-licensed key — `/intelligence/search` 403s on a plain
+# public API key.
+# ────────────────────────────────────────────────────────────────────
+
+VT_SEARCH_PAGE_LIMIT = 300  # VT's documented max `limit` per search page
+
+# ── registrar-ID fallback ───────────────────────────────────────────
+# A meaningful share of VT domain objects ship with a blank top-level
+# `registrar` attribute even though the raw WHOIS blob still carries a
+# numeric IANA registrar ID (e.g. `Domain registrar id: 69.0` or
+# `Registrar IANA ID: 69`) — VT's own attribute-extraction pipeline just
+# didn't parse a name out of that particular registrar's WHOIS format.
+# Resolve that ID against IANA's public registrar list instead of leaving
+# the column empty.
+_IANA_REGISTRAR_URL = "https://www.iana.org/assignments/registrar-ids/registrar-ids-1.csv"
+_IANA_REGISTRAR_MAP: Dict[int, str] = {}
+_IANA_REGISTRAR_LOADED_AT: float = 0.0
+_IANA_REGISTRAR_TTL = 7 * 24 * 3600  # registrar IDs rarely change; refresh weekly
+_IANA_REGISTRAR_LOCK = asyncio.Lock()
+
+_REGISTRAR_ID_RE = re.compile(
+    r'(?:domain registrar id|sponsoring registrar iana id|registrar iana id)'
+    r'\s*:\s*(\d+)',
+    re.IGNORECASE,
+)
+
+
+async def _ensure_iana_registrar_map(client: httpx.AsyncClient) -> None:
+    """Lazily fetch + cache IANA's registrar-ID → name table in-process.
+    Failures leave any existing (possibly stale) cache in place rather than
+    raising, so a transient IANA outage never fails the export."""
+    global _IANA_REGISTRAR_LOADED_AT
+    now = _dt.datetime.now().timestamp()
+    if _IANA_REGISTRAR_MAP and (now - _IANA_REGISTRAR_LOADED_AT) < _IANA_REGISTRAR_TTL:
+        return
+    async with _IANA_REGISTRAR_LOCK:
+        now = _dt.datetime.now().timestamp()
+        if _IANA_REGISTRAR_MAP and (now - _IANA_REGISTRAR_LOADED_AT) < _IANA_REGISTRAR_TTL:
+            return
+        try:
+            r = await client.get(_IANA_REGISTRAR_URL, timeout=15.0)
+            if r.status_code != 200:
+                return
+            reader = csv.reader(io.StringIO(r.text))
+            next(reader, None)  # header row: "ID",Registrar Name,Status,RDAP Base URL
+            new_map: Dict[int, str] = {}
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                try:
+                    rid = int(row[0].strip())
+                except ValueError:
+                    continue
+                name = row[1].strip()
+                if name and name.lower() != "reserved":
+                    new_map[rid] = name
+            if new_map:
+                _IANA_REGISTRAR_MAP.clear()
+                _IANA_REGISTRAR_MAP.update(new_map)
+                _IANA_REGISTRAR_LOADED_AT = now
+        except Exception:
+            pass
+
+
+def _extract_registrar_id(whois_text: str) -> Optional[int]:
+    if not whois_text:
+        return None
+    m = _REGISTRAR_ID_RE.search(whois_text)
+    if not m:
+        return None
+    try:
+        # VT sometimes renders the ID as a float string ("69.0").
+        return int(float(m.group(1)))
+    except ValueError:
+        return None
+
+
+async def _resolve_registrar(attrs: dict, client: httpx.AsyncClient) -> str:
+    """Return the registrar name, falling back to an IANA registrar-ID
+    lookup against the raw WHOIS text when VT's own `registrar` attribute
+    is blank. Returns "" if neither a name nor a resolvable ID is present."""
+    registrar = (attrs.get("registrar") or "").strip()
+    if registrar:
+        return registrar
+    rid = _extract_registrar_id(attrs.get("whois") or "")
+    if rid is None:
+        return ""
+    await _ensure_iana_registrar_map(client)
+    return _IANA_REGISTRAR_MAP.get(rid, "")
+
+
+# Relationship shortcuts probed per hit to populate "associations". Kept to
+# the four that actually carry attribution data (vs. the ~11 aliases
+# fetch_gti_intel probes for a single seed) since this runs once per search
+# hit and a wide list would multiply the request count past what's practical
+# for a bulk export.
+_VT_ASSOC_RELATIONSHIPS = (
+    "related_threat_actors", "collections", "associated_malware", "campaigns",
+)
+
+
+async def _fetch_vt_associations(client: "httpx.AsyncClient", item: dict,
+                                  headers: dict, sem: "asyncio.Semaphore") -> str:
+    """Best-effort "available associations" for one search hit — joins
+    whatever names come back from the relationship shortcuts that exist for
+    this object type / key entitlement. A 403/404/timeout on any single
+    relationship degrades to "skip it", never fails the row."""
+    self_url = ((item.get("links") or {}).get("self") or "").strip()
+    if not self_url:
+        return ""
+
+    async def _one(name: str) -> list:
+        try:
+            async with sem:
+                r = await client.get(f"{self_url}/{name}", params={"limit": 10},
+                                      headers=headers)
+            if r.status_code != 200:
+                return []
+            objs = (r.json() or {}).get("data") or []
+            names = []
+            for o in objs:
+                a = o.get("attributes") or {}
+                nm = a.get("name") or a.get("display_name") or a.get("value") or o.get("id") or ""
+                if nm:
+                    names.append(str(nm))
+            return names
+        except Exception:
+            return []
+
+    results = await asyncio.gather(*[_one(n) for n in _VT_ASSOC_RELATIONSHIPS])
+    seen: set = set()
+    flat: list = []
+    for lst in results:
+        for n in lst:
+            if n not in seen:
+                seen.add(n)
+                flat.append(n)
+    return "; ".join(flat)
+
+
+def _vt_search_row(item: dict, associations: str, registrar: str) -> dict:
+    """Flatten one VT Intelligence Search hit into the export's fixed column
+    set: domain, associations, gti score, detections, registrar, and the
+    creation / last-update WHOIS dates."""
+    attrs = item.get("attributes") or {}
+    stats = attrs.get("last_analysis_stats") or {}
+    malicious = int(stats.get("malicious", 0) or 0)
+    total = sum(int(v or 0) for v in stats.values())
+    gti_assessment = attrs.get("gti_assessment") or {}
+    gti_score = gti_assessment.get("threat_score")
+    if gti_score is None:
+        gti_score = attrs.get("gti_score") or attrs.get("score") or ""
+    created = attrs.get("creation_date")
+    updated = attrs.get("last_modification_date") or attrs.get("last_update_date")
+    return {
+        "domain": item.get("id", ""),
+        "associations": associations,
+        "gti_score": gti_score,
+        "detections": f"{malicious}/{total}",
+        "registrar": registrar,
+        "date_created": _normalize_ts(created) if created else "",
+        "date_last_updated": _normalize_ts(updated) if updated else "",
+    }
+
+
+async def fetch_vt_search_export(query: str, api_key: str, *,
+                                  max_results: int = 300,
+                                  include_associations: bool = True) -> dict:
+    """
+    Run a VirusTotal Intelligence Search query
+    (`GET /api/v3/intelligence/search`) to completion via cursor pagination
+    and shape every hit into one flat row for CSV export: domain,
+    associations, gti_score, detections, registrar, date_created,
+    date_last_updated.
+
+    Mirrors what an analyst would otherwise page through by hand in the VT
+    Intelligence UI — e.g.
+    `entity:domain domain_regex:"passkey*" creation_date:2026-04-20+`.
+
+    Requires a VT Enterprise / GTI-licensed key; a plain public API key gets
+    a 403 from `/intelligence/search` itself.
+
+    `include_associations` additionally probes each hit's relationship
+    shortcuts (collections / threat actors / malware / campaigns) — that's
+    up to 4 extra requests per hit, bounded by a small concurrency limit, so
+    it can be turned off for very large exports where speed matters more
+    than the associations column.
+    """
+    if not api_key:
+        return {"error": "VirusTotal API key not configured"}
+    query = (query or "").strip()
+    if not query:
+        return {"error": "Search query is required"}
+    max_results = max(1, min(int(max_results or 300), 3000))
+
+    url = "https://www.virustotal.com/api/v3/intelligence/search"
+    headers = {"x-apikey": api_key, "Accept": "application/json"}
+
+    items: list = []
+    cursor = None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while len(items) < max_results:
+                params = {"query": query,
+                          "limit": min(VT_SEARCH_PAGE_LIMIT, max_results - len(items))}
+                if cursor:
+                    params["cursor"] = cursor
+                r = await client.get(url, headers=headers, params=params)
+                if r.status_code == 401:
+                    return {"error": "VirusTotal key unauthorized (HTTP 401)"}
+                if r.status_code == 403:
+                    return {"error": "VirusTotal Intelligence Search requires an "
+                                      "Enterprise/GTI-licensed key (HTTP 403)"}
+                if r.status_code == 429:
+                    break  # return what's already collected instead of failing outright
+                if r.status_code != 200:
+                    return {"error": f"VirusTotal API error: {r.status_code}"}
+                data = r.json() or {}
+                page = data.get("data") or []
+                if not page:
+                    break
+                items.extend(page)
+                cursor = (data.get("meta") or {}).get("cursor")
+                if not cursor or len(items) >= max_results:
+                    break
+                await asyncio.sleep(0.5)  # polite pacing between search pages
+    except Exception as e:
+        return {"error": f"VirusTotal search failed: {e}"}
+
+    items = items[:max_results]
+
+    async with httpx.AsyncClient(timeout=15.0) as enrich_client:
+        registrar_list = await asyncio.gather(
+            *[_resolve_registrar(item.get("attributes") or {}, enrich_client)
+              for item in items]
+        )
+        if include_associations and items:
+            sem = asyncio.Semaphore(4)
+            assoc_list = await asyncio.gather(
+                *[_fetch_vt_associations(enrich_client, item, headers, sem)
+                  for item in items]
+            )
+        else:
+            assoc_list = ["" for _ in items]
+
+    rows = [_vt_search_row(item, assoc, reg)
+            for item, assoc, reg in zip(items, assoc_list, registrar_list)]
+    return {
+        "query": query,
+        "count": len(rows),
+        "rows": rows,
+        "truncated": len(rows) >= max_results,
+    }
 
 
 # ────────────────────────────────────────────────────────────────────

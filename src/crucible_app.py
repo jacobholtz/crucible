@@ -197,7 +197,7 @@ CT_PROVIDERS = {
 REVALIDATION_ENABLED = os.environ.get("REVALIDATION_ENABLED", "1") not in ("0", "false", "False", "")
 
 # Import the new intelligence extensions
-from intelligence_extensions import fetch_shodan_data, fetch_virustotal_passive_dns, fetch_virustotal_reputation, fetch_reverse_ip_lookup, correlate_ip_neighbors, identify_shared_infrastructure, EXPANDED_PHISHING_PATTERNS, fetch_subdomain_enumeration, check_social_media_presence, map_content_similarity, fetch_threatfox, fetch_otx_ip_passive_dns, fetch_otx_general, fetch_otx_domain_passive_dns, fetch_ip_hosted_domains_intel, fetch_gti_intel, fetch_circl_pdns, fetch_mnemonic_pdns, fetch_vt_crowdsourced, fetch_vt_sibling_infra, fetch_ct_timing, fetch_kit_fingerprint
+from intelligence_extensions import fetch_shodan_data, fetch_virustotal_passive_dns, fetch_virustotal_reputation, fetch_reverse_ip_lookup, correlate_ip_neighbors, identify_shared_infrastructure, EXPANDED_PHISHING_PATTERNS, fetch_subdomain_enumeration, check_social_media_presence, map_content_similarity, fetch_threatfox, fetch_otx_ip_passive_dns, fetch_otx_general, fetch_otx_domain_passive_dns, fetch_ip_hosted_domains_intel, fetch_gti_intel, fetch_circl_pdns, fetch_mnemonic_pdns, fetch_vt_crowdsourced, fetch_vt_sibling_infra, fetch_ct_timing, fetch_kit_fingerprint, fetch_vt_search_export
 import pdns_store
 import diff_engine
 from pivot_intel import (fetch_seed_fingerprint, shodan_favicon_pivot,
@@ -1179,7 +1179,18 @@ def generate_simple_typos(domain: str) -> list[dict]:
 # DOMAIN EXTRACTION
 # ════════════════════════════════════════════════════════════
 
-def extract_domains_from_certs(certs: list[dict], seed: str) -> list[dict]:
+def extract_domains_from_certs(certs: list[dict], seed: str, base: str | None = None) -> list[dict]:
+    """Build the S1 domain list from CT results.
+
+    A certificate's SAN list can bundle in dozens of unrelated domains from
+    other tenants of the same shared/multi-tenant issuer (e.g. marketing-email
+    platforms like Salesforce Marketing Cloud commonly put 50-100+ customer
+    subdomains on one cert). Without filtering, one matching cert pulls every
+    other tenant's domain into this investigation's results. `base` (the
+    queried domain, post eTLD+1 pivot if any) restricts results to names that
+    are actually that domain or a subdomain of it.
+    """
+    base = (base or seed).lower()
     seen = {seed}
     seed_label = seed.rsplit(".", 1)[0] if "." in seed else seed
     domains = [{"name": seed, "source": "seed", "flag": None,
@@ -1187,13 +1198,16 @@ def extract_domains_from_certs(certs: list[dict], seed: str) -> list[dict]:
     for c in certs:
         for name in (c.get("name_value") or "").split("\n"):
             n = name.strip().lower().lstrip("*.")
-            if n and n not in seen and DOMAIN_RE.match(n):
-                seen.add(n)
-                flag = "NEIBU" if n.startswith("neibu") else None
-                src = "certspotter" if c.get("_source") == "certspotter" else "cert"
-                label = n.rsplit(".", 1)[0] if "." in n else n
-                domains.append({"name": n, "source": src, "flag": flag,
-                                 "entropy": round(shannon_entropy(label), 2)})
+            if not n or n in seen or not DOMAIN_RE.match(n):
+                continue
+            if n != base and not n.endswith("." + base):
+                continue  # unrelated tenant on a shared multi-SAN cert
+            seen.add(n)
+            flag = "NEIBU" if n.startswith("neibu") else None
+            src = "certspotter" if c.get("_source") == "certspotter" else "cert"
+            label = n.rsplit(".", 1)[0] if "." in n else n
+            domains.append({"name": n, "source": src, "flag": flag,
+                             "entropy": round(shannon_entropy(label), 2)})
     return domains
 
 # ════════════════════════════════════════════════════════════
@@ -1892,7 +1906,7 @@ async def run_standard_pipeline(seed: str, ct_sources: set[str] | None = None, f
         src = (certs[0].get("_source") if certs else None) or "crtsh"
         src_label = {"crtsh":"crt.sh","certspotter":"certspotter","certkit":"certkit.io",
                      "censys":"censys","scantower":"scantower"}.get(src, src)
-        result["domains"] = extract_domains_from_certs(certs, seed)
+        result["domains"] = extract_domains_from_certs(certs, seed, target)
         yield sse("log",{"msg":f"S1: {len(certs)} certs via {src_label} → {len(result['domains'])} domains","type":"ok","stage":"S1"})
         neibu = [d for d in result["domains"] if d.get("flag")=="NEIBU"]
         if neibu: yield sse("log",{"msg":f"S1: {len(neibu)} NEIBU (内部) admin portals flagged — Chinese admin panel tell","type":"err","stage":"S1"})
@@ -3588,6 +3602,24 @@ async def api_vt_reputation(seed: str):
     # have to apply the threshold logic themselves.
     enriched = {**data, "findings": _findings_from_vt(data, context_seed=validated)}
     return JSONResponse(enriched)
+
+
+@app.get("/api/vt-search")
+async def api_vt_search(query: str = Query(...),
+                         max_results: int = Query(300, ge=1, le=3000),
+                         associations: bool = Query(True)):
+    """Bulk-export the hits of a VirusTotal Intelligence Search query
+    (e.g. `entity:domain domain_regex:"passkey*" creation_date:2026-04-20+`)
+    as flat rows for the VT SEARCH EXPORT tab's CSV download. Requires a VT
+    Enterprise/GTI-licensed key — plain public keys get a 403 from VT."""
+    data = await fetch_vt_search_export(
+        query, VIRUSTOTAL_API_KEY,
+        max_results=max_results, include_associations=associations,
+    )
+    if "error" in data:
+        return JSONResponse(data, status_code=502)
+    return JSONResponse(data)
+
 
 @app.get("/api/bulk")
 async def api_bulk(iocs: str = Query(...)):

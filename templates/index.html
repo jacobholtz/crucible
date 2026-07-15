@@ -824,6 +824,7 @@ body.theme-light .vt-badge.vt-malicious:hover{background:rgba(192,21,42,.06);}
       <button class="tab" data-mode="cert"         onclick="switchMode('cert')">CERT INTELLIGENCE</button>
       <button class="tab" data-mode="bulk"         onclick="switchMode('bulk')">BULK IOC</button>
       <button class="tab" data-mode="active"       onclick="switchMode('active')">ACTIVE SCAN</button>
+      <button class="tab" data-mode="vtsearch"     onclick="switchMode('vtsearch')">VT SEARCH EXPORT</button>
     </div>
   </div>
 </div>
@@ -1100,6 +1101,41 @@ body.theme-light .vt-badge.vt-malicious:hover{background:rgba(192,21,42,.06);}
   <div class="ebar" id="ebarBulk">
     <div class="erow"><button class="ebtn primary" onclick="exportBulkCSV()">EXPORT CSV</button><button class="ebtn" onclick="exportHTMLReport('bulk')">EXPORT HTML REPORT</button></div>
     <div class="erow"><label class="defang-wrap"><input type="checkbox" class="dcb" id="defangBulk"> DEFANG ON EXPORT</label></div>
+  </div>
+</div>
+
+<!-- ══ VT SEARCH EXPORT MODE ══ -->
+<div class="mode" id="mode-vtsearch">
+  <div style="background:rgba(80,255,200,.04);border:1px solid var(--cyan-dim);border-left:3px solid var(--cyan);padding:10px 16px;margin-bottom:14px;font-family:var(--mono);font-size:10px;color:var(--text-dim);line-height:1.7;">
+    <strong style="color:var(--cyan);">VT SEARCH EXPORT</strong> — run any VirusTotal Intelligence Search query and download every hit as one CSV (domain, associations, GTI score, detections, registrar, date created, date last updated). Requires a VT Enterprise/GTI-licensed key — <code>/intelligence/search</code> 403s on a plain public API key.
+  </div>
+  <div class="ipanel" data-lbl="VT INTELLIGENCE SEARCH QUERY">
+    <div class="ilabel">// VT SEARCH SYNTAX — E.G. entity:domain domain_regex:"passkey*" creation_date:2026-04-20+</div>
+    <textarea class="seed" id="vtSearchQuery" style="padding:10px 12px;min-height:60px;" placeholder='entity:domain domain_regex:&quot;passkey*&quot; creation_date:2026-04-20+' spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
+    <div style="margin-top:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;">
+      <button class="btn" id="vtSearchBtn" onclick="startVtSearch()" style="padding:9px 18px;">RUN SEARCH</button>
+      <label style="font-family:var(--mono);font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">
+        MAX RESULTS
+        <input type="number" id="vtSearchMax" value="300" min="1" max="3000" step="50"
+               style="width:76px;background:var(--bg2);border:1px solid var(--border);border-left:2px solid var(--cyan-dim);color:var(--cyan);font-family:var(--mono);font-size:11px;padding:4px 6px;outline:none;">
+      </label>
+      <label style="font-family:var(--mono);font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">
+        <input type="checkbox" id="vtSearchAssoc" checked> INCLUDE ASSOCIATIONS
+      </label>
+      <span style="font-family:var(--mono);font-size:9px;color:var(--text-muted);">Associations cost up to 4 extra API calls per hit — uncheck for faster/large exports</span>
+    </div>
+  </div>
+  <div class="log-panel">
+    <div class="log-hdr"><div class="log-title">VT SEARCH LOG</div><span id="vtSearchProg" style="font-family:var(--mono);font-size:9px;color:var(--text-dim);">READY</span></div>
+    <div class="log-body" id="vtSearchLog"><div class="ll info"><span class="lts">──:──:──</span><span class="lst">[READY]</span><span class="lm">Enter a VT Intelligence Search query and run. Server paginates the full result set before returning rows.</span></div></div>
+  </div>
+  <div class="rpanel" id="vtSearchTablePanel" style="margin-bottom:10px;display:none;">
+    <div class="phdr"><div class="ptitle"><div class="pdot"></div>VT SEARCH RESULTS</div><div class="pcount" id="vtSearchCount">0</div></div>
+    <div class="pbody" id="vtSearchTableBody" style="max-height:480px;overflow-y:auto;padding:0;"><div class="empty" style="padding:24px;">—</div></div>
+  </div>
+  <div class="ebar" id="ebarVtSearch" style="display:none;">
+    <div class="erow"><button class="ebtn primary" onclick="exportVtSearchCSV()">EXPORT CSV</button></div>
+    <div class="erow"><label class="defang-wrap"><input type="checkbox" class="dcb" id="defangVtSearch"> DEFANG ON EXPORT</label></div>
   </div>
 </div>
 
@@ -1626,7 +1662,7 @@ function switchMode(m){
   document.querySelectorAll('#tabsBar .tab').forEach(t=>{
     t.classList.toggle('active', t.dataset.mode === m);
   });
-  const moreModes = ['investigator','phishing','cert','bulk','active'];
+  const moreModes = ['investigator','phishing','cert','bulk','active','vtsearch'];
   const moreBtn = document.getElementById('tabsMoreBtn');
   if(moreBtn) moreBtn.classList.toggle('has-active', moreModes.includes(m));
   // Always collapse the dropdown after a pick.
@@ -1690,7 +1726,7 @@ const log=(m,t,s)=>logTo('logBody',m,t,s);
 // ════════════════════════════════
 // STATE
 // ════════════════════════════════
-let stdResult=null,invResult=null,phishResult=null,certResult=null,bulkData=null;
+let stdResult=null,invResult=null,phishResult=null,certResult=null,bulkData=null,vtSearchData=null;
 let running=false;
 let domainCount=0,dnsCount=0,ipCount=0;
 let ipResults=[];  // collected per-IP intel for the IP INTELLIGENCE dropdown
@@ -3179,7 +3215,13 @@ async function startInvestigator(){
     // Track both the pivot target and the raw user seed as "seen" so the
     // domain list doesn't show duplicates of those two anchors.
     const seen=new Set([seed, target].filter(Boolean));
-    for(const c of d.certs||[]){for(let n of (c.name_value||'').split('\n')){n=n.replace(/^\*\./,'').trim().toLowerCase();if(n&&!seen.has(n))seen.add(n),invResult.domains.push({name:n,issuer:c.issuer_name||'?'});}}
+    // A cert's SAN list can bundle in dozens of unrelated domains from other
+    // tenants of the same shared/multi-tenant issuer (e.g. marketing-email
+    // platforms routinely put 50-100+ customer subdomains on one cert) — only
+    // keep names that are actually `target` itself or a subdomain of it.
+    const targetLower=(target||'').toLowerCase();
+    const isRelated=n=>n===targetLower||n.endsWith('.'+targetLower);
+    for(const c of d.certs||[]){for(let n of (c.name_value||'').split('\n')){n=n.replace(/^\*\./,'').trim().toLowerCase();if(n&&!seen.has(n)&&isRelated(n))seen.add(n),invResult.domains.push({name:n,issuer:c.issuer_name||'?'});}}
     ilog(`${d.count} certs → ${invResult.domains.length} subdomains`,'ok','S1');
     const invDomBody=document.getElementById('invDomBody');invDomBody.innerHTML='';
     document.getElementById('invDomPanel').classList.add('has');
@@ -3720,6 +3762,69 @@ async function startBulk(){
   logTo('bulkLog',`Complete. ${results.length} IOCs enriched.`,'ok','DONE');
   document.getElementById('ebarBulk').classList.add('show');
   document.getElementById('bulkBtn').disabled=false;
+}
+
+async function startVtSearch(){
+  const query=document.getElementById('vtSearchQuery').value.trim();
+  if(!query)return;
+  const maxResults=Math.max(1,Math.min(3000,parseInt(document.getElementById('vtSearchMax').value,10)||300));
+  const includeAssoc=document.getElementById('vtSearchAssoc').checked;
+  const btn=document.getElementById('vtSearchBtn');
+  btn.disabled=true;
+  document.getElementById('vtSearchProg').textContent='RUNNING…';
+  document.getElementById('ebarVtSearch').style.display='none';
+  logTo('vtSearchLog',`Running: ${query}`,'info','VT');
+  if(includeAssoc) logTo('vtSearchLog','Associations enabled — this can take a while on large result sets.','info','VT');
+  try{
+    const r=await fetch(`/api/vt-search?query=${encodeURIComponent(query)}&max_results=${maxResults}&associations=${includeAssoc}`);
+    const d=await r.json();
+    if(!r.ok||d.error){
+      logTo('vtSearchLog',d.error||`HTTP ${r.status}`,'err','VT');
+      document.getElementById('vtSearchProg').textContent='ERROR';
+      btn.disabled=false;
+      return;
+    }
+    vtSearchData=d;
+    const tablePanel=document.getElementById('vtSearchTablePanel');
+    tablePanel.style.display='block';
+    const tableBody=document.getElementById('vtSearchTableBody');tableBody.innerHTML='';
+    const table=document.createElement('table');table.className='btable';
+    const thead=document.createElement('thead');
+    const hrow=document.createElement('tr');
+    ['DOMAIN','ASSOCIATIONS','GTI SCORE','DETECTIONS','REGISTRAR','CREATED','LAST UPDATED'].forEach(h=>{const th=document.createElement('th');th.textContent=h;hrow.appendChild(th);});
+    thead.appendChild(hrow);table.appendChild(thead);
+    const tbody=document.createElement('tbody');table.appendChild(tbody);
+    for(const row of d.rows||[]){
+      const tr=document.createElement('tr');
+      const td=(t,c)=>{const e=document.createElement('td');e.textContent=t;if(c)e.style.color=c;return e;};
+      tr.appendChild(td(row.domain,'var(--cyan)'));
+      tr.appendChild(td((row.associations||'').slice(0,80)));
+      tr.appendChild(td(String(row.gti_score??'')));
+      tr.appendChild(td(row.detections||''));
+      tr.appendChild(td(row.registrar||''));
+      tr.appendChild(td((row.date_created||'').slice(0,10)));
+      tr.appendChild(td((row.date_last_updated||'').slice(0,10)));
+      tbody.appendChild(tr);
+    }
+    tableBody.appendChild(table);
+    document.getElementById('vtSearchCount').textContent=String(d.count||0);
+    document.getElementById('vtSearchProg').textContent=`${d.count||0} HITS`;
+    logTo('vtSearchLog',`Complete. ${d.count||0} hits exported${d.truncated?' (capped at max results)':''}.`,'ok','DONE');
+    if((d.count||0)>0) document.getElementById('ebarVtSearch').style.display='block';
+  }catch(e){
+    logTo('vtSearchLog',`Request failed: ${e.message}`,'err','VT');
+    document.getElementById('vtSearchProg').textContent='ERROR';
+  }
+  btn.disabled=false;
+}
+
+function exportVtSearchCSV(){
+  if(!vtSearchData?.rows?.length)return;
+  const d=isDefanged('defangVtSearch');
+  const esc=(v)=>`"${String(v??'').replace(/"/g,'""')}"`;
+  const rows=['DOMAIN,ASSOCIATIONS,GTI_SCORE,DETECTIONS,REGISTRAR,DATE_CREATED,DATE_LAST_UPDATED',
+    ...vtSearchData.rows.map(r=>[tx(r.domain,d),r.associations,r.gti_score,r.detections,r.registrar,r.date_created,r.date_last_updated].map(esc).join(','))];
+  downloadBlob(rows.join('\n'),`crucible-vtsearch-${safeFilename(vtSearchData.query||'export')}${d?'-DEFANGED':''}-${Date.now()}.csv`,'text/csv');
 }
 
 // ════════════════════════════════
